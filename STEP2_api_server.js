@@ -12,7 +12,7 @@ app.use(express.urlencoded({ extended: false }));
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
 const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 const pendingFollowUp = new Map();
 const pendingOrders = new Map();    // phone -> { productName, timer }
@@ -193,54 +193,61 @@ async function logInteraction(customerId, phone, message, intent, category, repl
 }
 
 // ─────────────────────────────────────────────────
-// STEP 1: GEMINI — parse what the customer wants
-// Returns structured intent + extracted items
+// GEMINI — SINGLE CALL: parse intent + friendly reply together
+// One call instead of two — saves 50% of API quota
 // ─────────────────────────────────────────────────
-async function parseIntent(message, customerName, prefs) {
+async function parseIntentAndReply(message, customerName, prefs) {
   const prefList = prefs.map(p => p.category).join(', ') || 'not set';
-  const prompt = `You are parsing a WhatsApp message to a Dmart supermarket assistant.
+  const prompt = `You are Dmart Assistant — a smart, warm AI shopping friend for Dmart India supermarket.
 
-Customer name: ${customerName}
-Customer preferences: ${prefList}  
+Customer: ${customerName}
+Their preferences: ${prefList}
 Message: "${message}"
 
-Extract the intent and details. Reply ONLY with valid JSON, no markdown, no explanation:
+Do TWO things in ONE response:
+1. Parse the intent
+2. Write a friendly reply as a caring friend who knows Dmart well
 
+Reply ONLY with valid JSON, no markdown:
 {
-  "intent": "shopping_list | search_product | check_offers | browse_category | place_order | question | greeting | out_of_scope",
-  "items": ["item1", "item2"],
-  "search_keyword": "main product or category to search",
-  "order_product": "product name if placing an order, else null",
-  "category": null or "Snacks|Dairy|Fruits|Vegetables|Instant Food|Beverages|Beauty|Personal Care|Household|Grains|Spices|Cleaning",
-  "is_dmart_related": true or false
+  "intent": "shopping_list|search_product|check_offers|browse_category|place_order|question|greeting|out_of_scope",
+  "items": [],
+  "search_keyword": "main product or category keyword",
+  "order_product": null or "product name if ordering",
+  "category": null or exact category,
+  "is_dmart_related": true or false,
+  "friendly_reply": "warm 2-sentence reply as a friend. Subtly mention that picking up from Dmart saves money vs paying delivery fees elsewhere. Never name competitors. Sound natural."
 }
 
-Rules:
-- shopping_list: customer gives multiple items to check (like "Beans 1kg, Carrot, Lays, Wheat 5kg")
-- For shopping_list, extract ALL item names into "items" array — just the product names without quantities
-- place_order: customer says "order [product]" or "I want to order [product]" or "order it and I'll pick it up" — extract product name into order_product
-- search_product: asking about 1-2 specific products
-- browse_category: asking to show a category like "show snacks" or "show dairy"
-- check_offers: asking about deals, discounts, offers
-- question: asking a question about Dmart (timings, return policy, parking, app, etc)
-- out_of_scope: not related to shopping or Dmart at all
+Intent rules:
+- shopping_list: multiple items to check — extract ALL into items[] without quantities
+- place_order: customer says order/I want to order/pack it/I'll pick it up
+- search_product: 1-2 specific products asked
+- browse_category: show me snacks/dairy/fruits etc
+- check_offers: deals/discounts/offers
+- question: Dmart store info — timings, return policy, parking, app etc
+- greeting: hi/hello/hey
+- out_of_scope: cricket/movies/politics — not shopping
 
-For shopping_list, items = ["Beans","Carrot","Lays","Wheat","Seeraga samba rice","Sambar powder","Chili powder","Garam masala","Darkfantasy","Tomato","Brinjal","Bata shoe"]`;
+Categories: Snacks|Dairy|Fruits|Vegetables|Instant Food|Beverages|Beauty|Personal Care|Household|Grains|Spices|Cleaning|Footwear`;
 
   try {
     const res = await model.generateContent(prompt);
     const text = res.response.text().trim().replace(/```json|```/g, '').trim();
     const parsed = JSON.parse(text);
     if (!parsed.items) parsed.items = [];
+    if (!parsed.friendly_reply) parsed.friendly_reply = `Sure ${customerName}, let me help you with that!`;
     return parsed;
-  } catch (e) {
-    console.log('parseIntent error:', e.message);
+  } catch(e) {
+    console.log('parseIntentAndReply error:', e.message);
     return {
       intent: 'search_product',
       items: [],
-      search_keyword: message.split(' ').slice(0, 2).join(' '),
+      search_keyword: message.split(' ').slice(0,2).join(' '),
+      order_product: null,
       category: null,
-      is_dmart_related: true
+      is_dmart_related: true,
+      friendly_reply: `On it ${customerName}! Let me find that for you right now! 😊`
     };
   }
 }
@@ -340,11 +347,7 @@ async function sendProductCard(to, product, index, source) {
 async function handleShoppingList(to, customer, items, prefs) {
   console.log('Shopping list items:', items);
 
-  const friendMsg = await generateFriendlyReply(
-    customer.name,
-    `customer sent a shopping list with ${items.length} items to check availability`,
-    prefs
-  );
+  const friendMsg = parsed.friendly_reply;
 
   await sendText(to, `${friendMsg}\n\n📋 *Checking your ${items.length} items one by one...*\n⚡ Give me a moment!`);
   await sleep(1500);
@@ -423,11 +426,7 @@ async function handleShoppingList(to, customer, items, prefs) {
   const totalFound = available.length + fromGemini.length;
   await sleep(600);
 
-  const summaryMsg = await generateFriendlyReply(
-    customer.name,
-    `shopping list check complete. Found ${totalFound} out of ${items.length} items available at Dmart. ${notAvailable.length > 0 ? notAvailable.length + ' items not available.' : 'All items found!'}`,
-    prefs
-  );
+  const summaryMsg = parsed.friendly_reply;
 
   await sendText(to,
     `📊 *Shopping List Summary for ${customer.name}:*\n` +
@@ -585,8 +584,8 @@ async function processMessage(fromRaw, message) {
   }
 
   // ── PARSE INTENT ──
-  const parsed = await parseIntent(message, customer.name, prefs);
-  console.log('Intent:', parsed.intent, '| Keyword:', parsed.search_keyword, '| Items:', parsed.items?.length || 0);
+  const parsed = await parseIntentAndReply(message, customer.name, prefs);
+  console.log('Intent:', parsed.intent, parsed.search_keyword, '| Items:', parsed.items?.length || 0);
 
   // ── OUT OF SCOPE ──
   if (!parsed.is_dmart_related) {
@@ -637,7 +636,7 @@ async function processMessage(fromRaw, message) {
   if (parsed.intent === 'check_offers') {
     const offers = await getOffers(customer.customer_id);
     if (offers.length > 0) {
-      const friendMsg = await generateFriendlyReply(customer.name, 'customer wants to see offers', prefs);
+      const friendMsg = parsed.friendly_reply || `Sure, let me help you!`;
       await sendText(fromRaw,
         `${friendMsg}\n\n🔥 *${offers.length} live deals right now — many on things YOU buy!*`
       );
@@ -676,11 +675,7 @@ async function processMessage(fromRaw, message) {
 
   if (dbResults.length > 0) {
     // Found in DB — show with images
-    const friendMsg = await generateFriendlyReply(
-      customer.name,
-      `customer asked for ${keyword} and we found ${dbResults.length} products in Dmart store`,
-      prefs
-    );
+    const friendMsg = parsed.friendly_reply;
     await sendText(fromRaw,
       `${friendMsg}\n\n🛒 *Found ${dbResults.length} products for "${keyword}" at Dmart:*`
     );
@@ -704,11 +699,7 @@ async function processMessage(fromRaw, message) {
 
     if (geminiResult.available_at_dmart) {
       await addProductToDB(geminiResult.name, geminiResult.category, geminiResult.brand, geminiResult.price);
-      const friendMsg = await generateFriendlyReply(
-        customer.name,
-        `customer asked for ${keyword}. Found it in Dmart catalog — ${geminiResult.name} at Rs.${geminiResult.price}`,
-        prefs
-      );
+      const friendMsg = parsed.friendly_reply;
       await sendText(fromRaw,
         `${friendMsg}\n\n✅ *Found "${geminiResult.name}" at Dmart!*\n\n` +
         `📦 Category: ${geminiResult.category}\n` +
@@ -718,11 +709,7 @@ async function processMessage(fromRaw, message) {
         `Reply *"order ${geminiResult.name}"* to note it! 🛒`
       );
     } else {
-      const friendMsg = await generateFriendlyReply(
-        customer.name,
-        `customer asked for ${keyword} but it's not available at Dmart`,
-        prefs
-      );
+      const friendMsg = parsed.friendly_reply;
       await sendText(fromRaw,
         `${friendMsg}\n\n` +
         `😕 *"${keyword}" doesn't seem to be available at Dmart.*\n\n` +
