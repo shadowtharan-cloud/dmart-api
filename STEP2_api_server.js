@@ -11,12 +11,36 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
+const keys = process.env.GEMINI_API_KEYS.split(',');
+let currentKeyIndex = 0;
+
+function getModel() {
+  const key = keys[currentKeyIndex];
+  const genAI = new GoogleGenerativeAI(key);
+  return genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
+}
 const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 const pendingFollowUp = new Map();
 const pendingOrders = new Map();    // phone -> { productName, timer }
 const cancelledOrders = new Map();  // phone -> count of cancelled/fake orders
+
+async function generateWithRetry(prompt) {
+  for (let i = 0; i < keys.length; i++) {
+    try {
+      const model = getModel();
+      const res = await model.generateContent(prompt);
+      return res;
+    } catch (error) {
+      console.log(`Key ${currentKeyIndex} failed, switching...`);
+
+      currentKeyIndex = (currentKeyIndex + 1) % keys.length;
+
+      await new Promise(r => setTimeout(r, 300)); // small delay
+    }
+  }
+
+  throw new Error('All API keys failed');
+}
 
 async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
@@ -42,7 +66,7 @@ async function ensureOrderTables() {
         created_at TIMESTAMP DEFAULT NOW()
       );
     `);
-  } catch(e) { console.log('Table create note:', e.message); }
+  } catch (e) { console.log('Table create note:', e.message); }
 }
 ensureOrderTables();
 
@@ -189,7 +213,7 @@ async function logInteraction(customerId, phone, message, intent, category, repl
       `INSERT INTO customer_interactions(customer_id,phone_number,message,intent,category,bot_response) VALUES($1,$2,$3,$4,$5,$6)`,
       [customerId, phone, message, intent, category, reply]
     );
-  } catch (e) {}
+  } catch (e) { }
 }
 
 // ─────────────────────────────────────────────────
@@ -232,18 +256,18 @@ Intent rules:
 Categories: Snacks|Dairy|Fruits|Vegetables|Instant Food|Beverages|Beauty|Personal Care|Household|Grains|Spices|Cleaning|Footwear`;
 
   try {
-    const res = await model.generateContent(prompt);
+    const res = await generateWithRetry(prompt);
     const text = res.response.text().trim().replace(/```json|```/g, '').trim();
     const parsed = JSON.parse(text);
     if (!parsed.items) parsed.items = [];
     if (!parsed.friendly_reply) parsed.friendly_reply = `Sure ${customerName}, let me help you with that!`;
     return parsed;
-  } catch(e) {
+  } catch (e) {
     console.log('parseIntentAndReply error:', e.message);
     return {
       intent: 'search_product',
       items: [],
-      search_keyword: message.split(' ').slice(0,2).join(' '),
+      search_keyword: message.split(' ').slice(0, 2).join(' '),
       order_product: null,
       category: null,
       is_dmart_related: true,
@@ -276,7 +300,7 @@ If product exists at Dmart, set available_at_dmart: true with real approximate p
 If not at Dmart (like branded electronics, medicines etc), set available_at_dmart: false.`;
 
   try {
-    const res = await model.generateContent(prompt);
+    const res = await generateWithRetry(prompt);
     const text = res.response.text().trim().replace(/```json|```/g, '').trim();
     return JSON.parse(text);
   } catch (e) {
@@ -304,7 +328,7 @@ Write a SHORT friendly message (2-3 sentences max) as a caring friend who:
 Reply with ONLY the message text, no JSON, no quotes.`;
 
   try {
-    const res = await model.generateContent(prompt);
+    const res = await generateWithRetry(prompt);
     return res.response.text().trim();
   } catch (e) {
     return `Hey ${customerName}! Let me find the best options for you at Dmart right now! 😊`;
@@ -598,7 +622,7 @@ async function processMessage(fromRaw, message) {
 
     // Schedule follow-up after out-of-scope
     const handle = setTimeout(async () => {
-      try { await sendFollowUp(fromRaw, customer); pendingFollowUp.delete(phone); } catch (e) {}
+      try { await sendFollowUp(fromRaw, customer); pendingFollowUp.delete(phone); } catch (e) { }
     }, 60000);
     pendingFollowUp.set(phone, handle);
     return;
@@ -733,7 +757,7 @@ async function isCustomerBanned(customerId, phone) {
       [customerId, phone]
     );
     return r.rows[0] || null;
-  } catch(e) { return null; }
+  } catch (e) { return null; }
 }
 
 async function getCancelledCount(customerId) {
@@ -743,7 +767,7 @@ async function getCancelledCount(customerId) {
       [customerId]
     );
     return parseInt(r.rows[0].c);
-  } catch(e) { return 0; }
+  } catch (e) { return 0; }
 }
 
 async function createOrder(customerId, phone, productName) {
@@ -838,11 +862,11 @@ async function handleOrder(fromRaw, customer, productName, prefs) {
           }
           await sendText(fromRaw, msg);
           pendingOrders.delete(phone);
-        } catch(e) { console.error('No-show timer error:', e.message); }
+        } catch (e) { console.error('No-show timer error:', e.message); }
       }, 30 * 60 * 1000); // 30 minutes
 
       pendingOrders.set(phone, { orderId, productName, timer: noShowTimer, stage: 'ready' });
-    } catch(e) { console.error('Ready timer error:', e.message); }
+    } catch (e) { console.error('Ready timer error:', e.message); }
   }, 3 * 60 * 1000); // 3 minutes
 
   pendingOrders.set(phone, { orderId, productName, timer: readyTimer, stage: 'pending' });
@@ -873,9 +897,9 @@ Be warm, helpful, 2-3 sentences. If you don't know something specific, say "I'm 
 Reply with ONLY the answer text, no JSON, no quotes.`;
 
   try {
-    const res = await model.generateContent(prompt);
+    const res = await generateWithRetry(prompt);
     return res.response.text().trim();
-  } catch(e) {
+  } catch (e) {
     return `Great question ${customerName}! I'd recommend checking with your nearest Dmart store directly for the most accurate answer. You can also check the D-Mart Ready app for more info! 😊`;
   }
 }

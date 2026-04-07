@@ -1,0 +1,112 @@
+{
+  "name": "Dmart WhatsApp AI Assistant",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "whatsapp-dmart",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-node",
+      "name": "WhatsApp Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "notes": "This receives messages from WhatsApp (Twilio/360dialog). URL: http://localhost:5678/webhook/whatsapp-dmart"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Extract phone + message from WhatsApp webhook\n// Works with both Twilio and 360dialog format\n\nconst body = $input.first().json.body || $input.first().json;\n\n// Twilio format\nlet phone = body.From || body.WaId || '';\nlet message = body.Body || body.text?.body || '';\n\n// 360dialog format\nif (body.messages && body.messages[0]) {\n  phone = body.messages[0].from;\n  message = body.messages[0].text?.body || '';\n}\n\n// Clean phone number\nphone = phone.replace('whatsapp:', '').replace(/[^0-9]/g, '');\n\nreturn [{ json: { phone, message, raw: body } }];"
+      },
+      "id": "extract-node",
+      "name": "Extract Phone + Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:3000/chat",
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "phone": "={{ $json.phone }}",
+          "message": "={{ $json.message }}"
+        },
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "api-call-node",
+      "name": "Call Dmart AI API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [680, 300],
+      "notes": "Calls your local API server. Make sure STEP2_api_server.js is running!"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Get the AI reply from our API\nconst reply = $input.first().json.reply || 'Sorry, something went wrong. Please try again!';\nconst phone = $('Extract Phone + Message').first().json.phone;\n\nreturn [{ json: { reply, phone } }];"
+      },
+      "id": "prepare-reply-node",
+      "name": "Prepare Reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.twilio.com/2010-04-01/Accounts/{{ $env.TWILIO_ACCOUNT_SID }}/Messages.json",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendBody": true,
+        "contentType": "form",
+        "body": {
+          "From": "whatsapp:{{ $env.TWILIO_WHATSAPP_NUMBER }}",
+          "To": "whatsapp:+91{{ $json.phone }}",
+          "Body": "={{ $json.reply }}"
+        }
+      },
+      "id": "twilio-send-node",
+      "name": "Send via Twilio WhatsApp",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1120, 200],
+      "notes": "Uses Twilio Sandbox. Replace with production number when ready."
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"status\": \"ok\" }"
+      },
+      "id": "respond-node",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1120, 400]
+    }
+  ],
+  "connections": {
+    "WhatsApp Webhook": {
+      "main": [[{ "node": "Extract Phone + Message", "type": "main", "index": 0 }]]
+    },
+    "Extract Phone + Message": {
+      "main": [[{ "node": "Call Dmart AI API", "type": "main", "index": 0 }]]
+    },
+    "Call Dmart AI API": {
+      "main": [[{ "node": "Prepare Reply", "type": "main", "index": 0 }]]
+    },
+    "Prepare Reply": {
+      "main": [
+        [{ "node": "Send via Twilio WhatsApp", "type": "main", "index": 0 }],
+        [{ "node": "Respond to Webhook", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
