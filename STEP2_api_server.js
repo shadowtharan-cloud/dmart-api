@@ -11,36 +11,81 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
-const keys = process.env.GEMINI_API_KEYS.split(',');
-let currentKeyIndex = 0;
+// ─────────────────────────────────────────────────
+// GEMINI API KEY ROTATION — 16 keys auto-rotate
+// Add in Render: GEMINI_API_KEY_1 to GEMINI_API_KEY_16
+// ─────────────────────────────────────────────────
+const GEMINI_KEYS = [];
+for (let i = 1; i <= 16; i++) {
+  const k = process.env['GEMINI_API_KEY_' + i];
+  if (k && k.trim()) GEMINI_KEYS.push(k.trim());
+}
+if (process.env.GEMINI_API_KEY) GEMINI_KEYS.push(process.env.GEMINI_API_KEY);
+if (GEMINI_KEYS.length === 0) { console.error('No Gemini keys found!'); process.exit(1); }
+console.log('Loaded ' + GEMINI_KEYS.length + ' Gemini key(s)');
 
-function getModel() {
-  const key = keys[currentKeyIndex];
-  const genAI = new GoogleGenerativeAI(key);
-  return genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
+let currentKeyIndex = 0;
+const keyStatus = GEMINI_KEYS.map((_, i) => ({ index: i, calls: 0, exhausted: false, resetAt: null }));
+
+function getCurrentModel() {
+  return new GoogleGenerativeAI(GEMINI_KEYS[currentKeyIndex]).getGenerativeModel({ model: 'gemini-2.0-flash' });
+}
+
+function rotateKey() {
+  for (let i = 1; i <= GEMINI_KEYS.length; i++) {
+    const next = (currentKeyIndex + i) % GEMINI_KEYS.length;
+    if (!keyStatus[next].exhausted) {
+      currentKeyIndex = next;
+      console.log('Rotated to Gemini key ' + (currentKeyIndex + 1) + '/' + GEMINI_KEYS.length);
+      return;
+    }
+  }
+  // All exhausted — reset oldest
+  keyStatus.forEach(k => { k.exhausted = false; k.resetAt = null; });
+  currentKeyIndex = 0;
+  console.log('All keys reset — restarting from key 1');
+}
+
+// Reset exhausted keys every minute
+setInterval(() => {
+  const now = Date.now();
+  keyStatus.forEach(k => {
+    if (k.exhausted && k.resetAt && now > k.resetAt) {
+      k.exhausted = false;
+      console.log('Key ' + (k.index + 1) + ' quota reset');
+    }
+  });
+}, 60000);
+
+async function callGemini(prompt) {
+  let attempts = 0;
+  while (attempts < GEMINI_KEYS.length) {
+    try {
+      const model = getCurrentModel();
+      keyStatus[currentKeyIndex].calls++;
+      const res = await model.generateContent(prompt);
+      return res.response.text().trim();
+    } catch (e) {
+      const msg = e.message || '';
+      if (msg.includes('429') || msg.includes('quota') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('Too Many')) {
+        console.log('Key ' + (currentKeyIndex + 1) + ' quota hit — rotating...');
+        keyStatus[currentKeyIndex].exhausted = true;
+        keyStatus[currentKeyIndex].resetAt = Date.now() + 65000;
+        rotateKey();
+        attempts++;
+        await sleep(500);
+        continue;
+      }
+      throw e;
+    }
+  }
+  console.error('All Gemini keys exhausted');
+  return null;
 }
 const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 const pendingFollowUp = new Map();
 const pendingOrders = new Map();    // phone -> { productName, timer }
 const cancelledOrders = new Map();  // phone -> count of cancelled/fake orders
-
-async function generateWithRetry(prompt) {
-  for (let i = 0; i < keys.length; i++) {
-    try {
-      const model = getModel();
-      const res = await model.generateContent(prompt);
-      return res;
-    } catch (error) {
-      console.log(`Key ${currentKeyIndex} failed, switching...`);
-
-      currentKeyIndex = (currentKeyIndex + 1) % keys.length;
-
-      await new Promise(r => setTimeout(r, 300)); // small delay
-    }
-  }
-
-  throw new Error('All API keys failed');
-}
 
 async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
@@ -66,7 +111,7 @@ async function ensureOrderTables() {
         created_at TIMESTAMP DEFAULT NOW()
       );
     `);
-  } catch (e) { console.log('Table create note:', e.message); }
+  } catch(e) { console.log('Table create note:', e.message); }
 }
 ensureOrderTables();
 
@@ -213,7 +258,7 @@ async function logInteraction(customerId, phone, message, intent, category, repl
       `INSERT INTO customer_interactions(customer_id,phone_number,message,intent,category,bot_response) VALUES($1,$2,$3,$4,$5,$6)`,
       [customerId, phone, message, intent, category, reply]
     );
-  } catch (e) { }
+  } catch (e) {}
 }
 
 // ─────────────────────────────────────────────────
@@ -256,18 +301,19 @@ Intent rules:
 Categories: Snacks|Dairy|Fruits|Vegetables|Instant Food|Beverages|Beauty|Personal Care|Household|Grains|Spices|Cleaning|Footwear`;
 
   try {
-    const res = await generateWithRetry(prompt);
-    const text = res.response.text().trim().replace(/```json|```/g, '').trim();
+    const raw = await callGemini(prompt);
+    if (!raw) throw new Error("All keys exhausted");
+    const text = raw.replace(/```json|```/g, '').trim();
     const parsed = JSON.parse(text);
     if (!parsed.items) parsed.items = [];
     if (!parsed.friendly_reply) parsed.friendly_reply = `Sure ${customerName}, let me help you with that!`;
     return parsed;
-  } catch (e) {
+  } catch(e) {
     console.log('parseIntentAndReply error:', e.message);
     return {
       intent: 'search_product',
       items: [],
-      search_keyword: message.split(' ').slice(0, 2).join(' '),
+      search_keyword: message.split(' ').slice(0,2).join(' '),
       order_product: null,
       category: null,
       is_dmart_related: true,
@@ -300,8 +346,9 @@ If product exists at Dmart, set available_at_dmart: true with real approximate p
 If not at Dmart (like branded electronics, medicines etc), set available_at_dmart: false.`;
 
   try {
-    const res = await generateWithRetry(prompt);
-    const text = res.response.text().trim().replace(/```json|```/g, '').trim();
+    const raw = await callGemini(prompt);
+    if (!raw) return { available_at_dmart: false, note: "API unavailable" };
+    const text = raw.replace(/```json|```/g, '').trim();
     return JSON.parse(text);
   } catch (e) {
     return { available_at_dmart: false, note: 'Could not verify' };
@@ -328,8 +375,8 @@ Write a SHORT friendly message (2-3 sentences max) as a caring friend who:
 Reply with ONLY the message text, no JSON, no quotes.`;
 
   try {
-    const res = await generateWithRetry(prompt);
-    return res.response.text().trim();
+    const raw = await callGemini(prompt);
+    return raw || `I'll need to check on that for you ${customerName}! Please ask at your nearest Dmart store. 😊`;
   } catch (e) {
     return `Hey ${customerName}! Let me find the best options for you at Dmart right now! 😊`;
   }
@@ -622,7 +669,7 @@ async function processMessage(fromRaw, message) {
 
     // Schedule follow-up after out-of-scope
     const handle = setTimeout(async () => {
-      try { await sendFollowUp(fromRaw, customer); pendingFollowUp.delete(phone); } catch (e) { }
+      try { await sendFollowUp(fromRaw, customer); pendingFollowUp.delete(phone); } catch (e) {}
     }, 60000);
     pendingFollowUp.set(phone, handle);
     return;
@@ -757,7 +804,7 @@ async function isCustomerBanned(customerId, phone) {
       [customerId, phone]
     );
     return r.rows[0] || null;
-  } catch (e) { return null; }
+  } catch(e) { return null; }
 }
 
 async function getCancelledCount(customerId) {
@@ -767,7 +814,7 @@ async function getCancelledCount(customerId) {
       [customerId]
     );
     return parseInt(r.rows[0].c);
-  } catch (e) { return 0; }
+  } catch(e) { return 0; }
 }
 
 async function createOrder(customerId, phone, productName) {
@@ -862,11 +909,11 @@ async function handleOrder(fromRaw, customer, productName, prefs) {
           }
           await sendText(fromRaw, msg);
           pendingOrders.delete(phone);
-        } catch (e) { console.error('No-show timer error:', e.message); }
+        } catch(e) { console.error('No-show timer error:', e.message); }
       }, 30 * 60 * 1000); // 30 minutes
 
       pendingOrders.set(phone, { orderId, productName, timer: noShowTimer, stage: 'ready' });
-    } catch (e) { console.error('Ready timer error:', e.message); }
+    } catch(e) { console.error('Ready timer error:', e.message); }
   }, 3 * 60 * 1000); // 3 minutes
 
   pendingOrders.set(phone, { orderId, productName, timer: readyTimer, stage: 'pending' });
@@ -897,9 +944,9 @@ Be warm, helpful, 2-3 sentences. If you don't know something specific, say "I'm 
 Reply with ONLY the answer text, no JSON, no quotes.`;
 
   try {
-    const res = await generateWithRetry(prompt);
-    return res.response.text().trim();
-  } catch (e) {
+    const raw = await callGemini(prompt);
+    return raw || `I'll need to check on that for you ${customerName}! Please ask at your nearest Dmart store. 😊`;
+  } catch(e) {
     return `Great question ${customerName}! I'd recommend checking with your nearest Dmart store directly for the most accurate answer. You can also check the D-Mart Ready app for more info! 😊`;
   }
 }
@@ -924,6 +971,19 @@ app.post('/whatsapp', (req, res) => {
 });
 
 app.get('/health', (req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
+
+app.get('/keystatus', (req, res) => {
+  res.json({
+    total_keys: GEMINI_KEYS.length,
+    active_key: currentKeyIndex + 1,
+    keys: keyStatus.map(k => ({
+      key_number: k.index + 1,
+      calls_made: k.calls,
+      exhausted: k.exhausted,
+      resets_at: k.resetAt ? new Date(k.resetAt).toISOString() : null
+    }))
+  });
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
