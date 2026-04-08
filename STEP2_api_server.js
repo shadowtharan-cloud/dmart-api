@@ -79,6 +79,10 @@ const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_A
 const pendingFollowUp = new Map(); // phone -> timer handle
 const pendingOrders = new Map();   // phone -> { orderId, productName, timer, stage }
 
+// Conversation memory — remembers last shopping list result per customer
+// So follow-up messages like "pack the available ones" work correctly
+const conversationMemory = new Map(); // phone -> { lastIntent, availableItems, notAvailableItems, lastProducts, timestamp }
+
 async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 // ─────────────────────────────────────────────────
@@ -265,69 +269,53 @@ async function logInteraction(customerId, phone, message, intent, category, repl
 // THE ONLY GEMINI CALL — does everything in one shot
 // Intent + reply + items + product checks — ALL in one call
 // ─────────────────────────────────────────────────
-async function analyzeMessage(message, customerName, prefs, unknownItems = []) {
+async function analyzeMessage(message, customerName, prefs, unknownItems = [], context = null) {
   const prefList = prefs.map(p => p.category).join(', ') || 'General';
-
-  // Build the unknown items check section only if needed
   const unknownSection = unknownItems.length > 0 ? `
-Also check these items that are NOT in our database — for each one tell if Dmart India sells it and give approximate price:
-Items to check: ${unknownItems.join(', ')}
-Include in your JSON under "gemini_products": array of {name, category, brand, price, available_at_dmart: true/false}` : '';
+Also check these NOT in our database — tell if Dmart India sells it and approximate price:
+Items: ${unknownItems.join(', ')}
+Include under "gemini_products": [{name, category, brand, price, available_at_dmart: true/false}]` : '';
 
-  const prompt = `You are Dmart India's WhatsApp shopping assistant. You know all products Dmart sells.
+  const contextSection = context ? `
+PREVIOUS MESSAGE CONTEXT:
+- Last action: ${context.lastIntent}
+- Available items from last list: ${(context.availableItems||[]).join(', ')||'none'}
+- Not available: ${(context.notAvailableItems||[]).join(', ')||'none'}
+- Last products shown: ${(context.lastProducts||[]).slice(0,3).map(p=>p.name).join(', ')||'none'}
+If the new message is a follow-up to above (like "pack available ones", "order available items", "show those products", "except unavailable show available") — set intent to "follow_up_action" and follow_up_type to "order_available" or "show_available".` : '';
 
-Customer: ${customerName}
-Their preferences: ${prefList}
-Their message: "${message}"
+  const prompt = `You are Dmart India WhatsApp shopping assistant.
+Customer: ${customerName} | Preferences: ${prefList}
+Message: "${message}"
+${contextSection}
 ${unknownSection}
-
-Reply ONLY with valid JSON (no markdown, no explanation):
+Reply ONLY valid JSON no markdown:
 {
-  "intent": "greeting|shopping_list|search_product|browse_category|check_offers|place_order|question|out_of_scope",
+  "intent": "greeting|shopping_list|search_product|browse_category|check_offers|place_order|follow_up_action|question|out_of_scope",
+  "follow_up_type": null,
   "items": [],
-  "keyword": "main product/category to search",
+  "keyword": "main product/category",
   "order_product": null,
   "is_dmart_related": true,
-  "reply": "friendly 1-2 sentence reply as a caring friend. If shopping/products, subtly mention Dmart saves money vs ordering apps (don't name any app). Sound warm and natural.",
+  "reply": "friendly 1-2 sentence reply, subtly mention Dmart saves money vs delivery apps without naming them",
   "dmart_answer": null,
   "gemini_products": []
 }
-
-Intent rules:
-- shopping_list: 3+ items listed to check — put ALL item names (without quantities) in items[]
-- place_order: says order/pack it/I'll pick it up
-- search_product: asking about 1-2 specific products
-- browse_category: show me snacks/dairy/fruits etc
-- check_offers: deals/offers/discounts
-- question: asks about store timings/return policy/parking/app — put the answer in dmart_answer field
-- greeting: hi/hello/hey/good morning
-- out_of_scope: cricket/movies/politics/nothing to do with shopping
-
-For question intent, set dmart_answer to a helpful 2-sentence answer about Dmart India.
+Intent: follow_up_action=customer responds to previous list result | shopping_list=3+ items to check | place_order=specific product order | search_product=1-2 products | browse_category=show category | check_offers=deals | question=store info | greeting=hello | out_of_scope=not shopping
+For question: put 2-sentence answer in dmart_answer.
 Categories: Snacks|Dairy|Fruits|Vegetables|Instant Food|Beverages|Beauty|Personal Care|Household|Grains|Spices|Cleaning|Footwear`;
 
   try {
     const raw = await callGemini(prompt);
     if (!raw) throw new Error('No response');
-    const clean = raw.replace(/```json|```/g, '').trim();
-    const parsed = JSON.parse(clean);
+    const parsed = JSON.parse(raw.replace(/```json|```/g, '').trim());
     if (!parsed.items) parsed.items = [];
     if (!parsed.gemini_products) parsed.gemini_products = [];
     if (!parsed.reply) parsed.reply = `On it ${customerName}! 😊`;
     return parsed;
   } catch(e) {
-    console.log('analyzeMessage parse error:', e.message);
-    // Safe fallback — no Gemini wasted
-    return {
-      intent: 'search_product',
-      items: [],
-      keyword: message.split(' ').filter(w => w.length > 2).slice(0,2).join(' ') || message,
-      order_product: null,
-      is_dmart_related: true,
-      reply: `On it ${customerName}! Let me check that for you 😊`,
-      dmart_answer: null,
-      gemini_products: []
-    };
+    console.log('analyzeMessage error:', e.message);
+    return { intent:'search_product', follow_up_type:null, items:[], keyword:message.split(' ').filter(w=>w.length>2).slice(0,2).join(' ')||message, order_product:null, is_dmart_related:true, reply:`On it ${customerName}! 😊`, dmart_answer:null, gemini_products:[] };
   }
 }
 
@@ -513,6 +501,20 @@ async function handleShoppingList(to, customer, items, prefs, parsedReply) {
     `\n\nJust walk in — everything's in stock. No delivery wait, no extra charges. 😊\n\n` +
     `Want to order and note it for pickup? Just say *"pack it, I'll pick it up"*! 📦`
   );
+
+  // SAVE CONVERSATION MEMORY — so follow-up messages work
+  const phone = to.replace('whatsapp:', '').replace('+', '');
+  const availableNames = [...foundItems.map(f => f.item), ...unknownItems.filter(i => geminiProducts[i]?.available_at_dmart).map(i => geminiProducts[i].name)];
+  const notAvailableNames = unknownItems.filter(i => !geminiProducts[i]?.available_at_dmart);
+  conversationMemory.set(phone, {
+    lastIntent: 'shopping_list',
+    availableItems: availableNames,
+    notAvailableItems: notAvailableNames,
+    lastProducts: foundItems.map(f => f.product),
+    timestamp: Date.now()
+  });
+  // Memory expires after 30 minutes
+  setTimeout(() => conversationMemory.delete(phone), 30 * 60 * 1000);
 }
 
 // ─────────────────────────────────────────────────
@@ -663,8 +665,72 @@ async function processMessage(fromRaw, message) {
   }
 
   // ── PARSE WITH GEMINI (1 call) ──
-  const parsed = await analyzeMessage(message, customer.name, prefs);
-  console.log('Intent:', parsed.intent, '| Keyword:', parsed.keyword, '| Items:', parsed.items?.length);
+  // Pass conversation memory so Gemini understands follow-up messages
+  const context = conversationMemory.get(phone) || null;
+  const parsed = await analyzeMessage(message, customer.name, prefs, [], context);
+  console.log('Intent:', parsed.intent, '| follow_up_type:', parsed.follow_up_type, '| Keyword:', parsed.keyword);
+
+  // ── FOLLOW-UP ACTION (e.g. "pack the available ones", "show me the available products") ──
+  if (parsed.intent === 'follow_up_action' && context) {
+    const { availableItems, lastProducts } = context;
+
+    if (!availableItems || availableItems.length === 0) {
+      await sendText(fromRaw,
+        `😊 ${parsed.reply}\n\nHmm, I don't have a recent shopping list result to refer to. Could you send your list again? 📋`
+      );
+      return;
+    }
+
+    if (parsed.follow_up_type === 'order_available') {
+      // Customer wants to order all available items
+      await sendText(fromRaw,
+        `✅ *Got it ${customer.name}!*\n\n` +
+        `I'm noting your order for these available items:\n` +
+        availableItems.map(i => `• ${i}`).join('\n') +
+        `\n\n⏳ Give us *3 minutes* to prepare everything!\n\n` +
+        `📍 Please have payment ready when you come to Dmart. _(Pay at the counter — easy!)_ 😊`
+      );
+
+      // Create orders for each item
+      for (const item of availableItems.slice(0, 5)) {
+        try {
+          await pool.query(
+            `INSERT INTO customer_orders(customer_id,phone_number,product_name,status) VALUES($1,$2,$3,'pending')`,
+            [customer.customer_id, phone, item]
+          );
+        } catch(e) {}
+      }
+
+      setTimeout(async () => {
+        try {
+          await sendText(fromRaw,
+            `🎉 *${customer.name}, your items are READY!*\n\n` +
+            `✅ Packed and waiting at Dmart:\n` +
+            availableItems.map(i => `• ${i}`).join('\n') +
+            `\n\n📍 Come pick them up anytime. Payment at the counter! 😊`
+          );
+        } catch(e) {}
+      }, 3 * 60 * 1000);
+
+    } else {
+      // Customer wants to see the available products again
+      await sendText(fromRaw,
+        `${parsed.reply}\n\n✅ *Here are the available items from your list:*\n\n` +
+        availableItems.map(i => `• ${i}`).join('\n') +
+        `\n\nSay *"pack it, I'll pick it up"* to order all of these! 📦`
+      );
+      await sleep(700);
+      // Show product cards for items we have images for
+      const cardsToShow = lastProducts?.filter(p => p.image_url && p.image_url.startsWith('http')).slice(0, 3) || [];
+      for (let i = 0; i < cardsToShow.length; i++) {
+        await sendProductCard(fromRaw, cardsToShow[i], i === 0);
+        await sleep(600);
+      }
+    }
+
+    await logInteraction(customer.customer_id, phone, message, 'follow_up_action', null, 'follow-up handled');
+    return;
+  }
 
   // ── GREETING — no DB search needed ──
   if (parsed.intent === 'greeting') {
