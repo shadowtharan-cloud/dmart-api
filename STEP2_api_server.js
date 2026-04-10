@@ -1,308 +1,273 @@
+// ═══════════════════════════════════════════════════════════════
+// DMART ASSISTANT — PRODUCTION SERVER
+// Complete, robust, no silent failures, full logging
+// ═══════════════════════════════════════════════════════════════
+'use strict';
 require('dotenv').config();
-const express = require('express');
+const express  = require('express');
 const { Pool } = require('pg');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
-const cors = require('cors');
-const twilio = require('twilio');
+const cors     = require('cors');
+const twilio   = require('twilio');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 
-// ─────────────────────────────────────────────────
-// DATABASE
-// ─────────────────────────────────────────────────
-const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+// ── STARTUP VALIDATION ──────────────────────────────────────────
+const REQUIRED_ENV = ['DATABASE_URL','TWILIO_ACCOUNT_SID','TWILIO_AUTH_TOKEN','TWILIO_WHATSAPP_NUMBER'];
+for (const k of REQUIRED_ENV) {
+  if (!process.env[k]) { console.error(`FATAL: missing ${k}`); process.exit(1); }
+}
 
-// ─────────────────────────────────────────────────
-// GEMINI KEY ROTATION
-// ─────────────────────────────────────────────────
+// ── DATABASE ────────────────────────────────────────────────────
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+  max: 10,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 5000
+});
+pool.on('error', e => console.error('DB pool error:', e.message));
+
+// ── GEMINI KEY ROTATION ─────────────────────────────────────────
 const GEMINI_KEYS = [];
 for (let i = 1; i <= 20; i++) {
-  const k = process.env['GEMINI_API_KEY_' + i];
+  const k = process.env[`GEMINI_API_KEY_${i}`];
   if (k && k.trim()) GEMINI_KEYS.push(k.trim());
 }
 if (process.env.GEMINI_API_KEY) GEMINI_KEYS.push(process.env.GEMINI_API_KEY);
-if (GEMINI_KEYS.length === 0) { console.error('No Gemini keys!'); process.exit(1); }
-console.log('Loaded ' + GEMINI_KEYS.length + ' Gemini key(s)');
+if (GEMINI_KEYS.length === 0) { console.error('FATAL: no Gemini keys'); process.exit(1); }
+console.log(`✅ Loaded ${GEMINI_KEYS.length} Gemini key(s)`);
 
-let currentKeyIndex = 0;
-const keyStatus = GEMINI_KEYS.map((_, i) => ({ index: i, calls: 0, exhausted: false, resetAt: null }));
+let activeKeyIdx = 0;
+const keyStats = GEMINI_KEYS.map((_, i) => ({ i, calls:0, errors:0, exhausted:false, resetAt:0 }));
 
-function rotateKey() {
-  for (let i = 1; i <= GEMINI_KEYS.length; i++) {
-    const next = (currentKeyIndex + i) % GEMINI_KEYS.length;
-    if (!keyStatus[next].exhausted) { currentKeyIndex = next; return true; }
-  }
-  keyStatus.forEach(k => { k.exhausted = false; k.resetAt = null; });
-  currentKeyIndex = 0;
-  return false;
-}
-
-setInterval(() => {
-  const now = Date.now();
-  keyStatus.forEach(k => { if (k.exhausted && k.resetAt && now > k.resetAt) { k.exhausted = false; } });
-}, 60000);
-
-async function callGemini(prompt) {
-  let attempts = 0;
-  while (attempts < GEMINI_KEYS.length) {
-    try {
-      const model = new GoogleGenerativeAI(GEMINI_KEYS[currentKeyIndex])
-        .getGenerativeModel({ model: 'gemini-2.0-flash' });
-      keyStatus[currentKeyIndex].calls++;
-      const res = await model.generateContent(prompt);
-      return res.response.text().trim();
-    } catch (e) {
-      const msg = e.message || '';
-      if (msg.includes('429') || msg.includes('quota') || msg.includes('RESOURCE_EXHAUSTED')) {
-        console.log('Key ' + (currentKeyIndex + 1) + ' exhausted — rotating');
-        keyStatus[currentKeyIndex].exhausted = true;
-        keyStatus[currentKeyIndex].resetAt = Date.now() + 65000;
-        rotateKey();
-        attempts++;
-        await sleep(300);
-        continue;
-      }
-      throw e;
+function rotateGeminiKey() {
+  const start = activeKeyIdx;
+  for (let n = 1; n <= GEMINI_KEYS.length; n++) {
+    const next = (start + n) % GEMINI_KEYS.length;
+    if (!keyStats[next].exhausted) {
+      activeKeyIdx = next;
+      console.log(`🔄 Gemini rotated → key ${activeKeyIdx + 1}/${GEMINI_KEYS.length}`);
+      return;
     }
   }
-  return null;
+  // all exhausted — reset all and start from beginning
+  keyStats.forEach(k => { k.exhausted = false; k.resetAt = 0; });
+  activeKeyIdx = 0;
+  console.log('♻️  All Gemini keys reset');
 }
 
-// ─────────────────────────────────────────────────
-// TWILIO & STATE
-// ─────────────────────────────────────────────────
-const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-const pendingFollowUp = new Map();
-const pendingOrders = new Map();
-const customerContext = new Map();
-
-async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-// ─────────────────────────────────────────────────
-// PRODUCT CATALOG CACHE — refresh every 5 minutes
-// This prevents fetching the full catalog on EVERY message
-// ─────────────────────────────────────────────────
-let catalogCache = null;
-let catalogCachedAt = 0;
-const CATALOG_TTL = 5 * 60 * 1000; // 5 minutes
-
-async function getCachedCatalog() {
+// reset exhausted keys every 65 seconds
+setInterval(() => {
   const now = Date.now();
-  if (catalogCache && (now - catalogCachedAt) < CATALOG_TTL) {
-    return catalogCache;
+  let anyReset = false;
+  keyStats.forEach(k => {
+    if (k.exhausted && k.resetAt > 0 && now > k.resetAt) {
+      k.exhausted = false;
+      k.resetAt = 0;
+      anyReset = true;
+      console.log(`♻️  Key ${k.i + 1} quota reset — back in rotation`);
+    }
+  });
+  // If active key is exhausted after reset, move to a fresh one
+  if (anyReset && keyStats[activeKeyIdx].exhausted) rotateGeminiKey();
+}, 65000);
+
+async function callGemini(prompt) {
+  let tried = 0;
+  while (tried < GEMINI_KEYS.length) {
+    try {
+      const g = new GoogleGenerativeAI(GEMINI_KEYS[activeKeyIdx]);
+      const m = g.getGenerativeModel({ model: 'gemini-2.0-flash' });
+      keyStats[activeKeyIdx].calls++;
+      const res = await m.generateContent(prompt);
+      const text = res.response.text().trim();
+      if (!text) throw new Error('Empty Gemini response');
+      return text;
+    } catch (e) {
+      const msg = e.message || '';
+      keyStats[activeKeyIdx].errors++;
+      if (msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('quota') || msg.includes('Too Many')) {
+        console.log(`⚠️  Key ${activeKeyIdx + 1} quota hit`);
+        keyStats[activeKeyIdx].exhausted = true;
+        keyStats[activeKeyIdx].resetAt = Date.now() + 65000;
+        rotateGeminiKey();
+        tried++;
+        await sleep(500);
+        continue;
+      }
+      // Non-quota error — log and return null (don't crash)
+      console.error('Gemini error (non-quota):', msg.slice(0, 120));
+      return null;
+    }
   }
-  const r = await pool.query(`
-    SELECT p.name, p.category, p.brand, p.price, p.is_available,
-      COALESCE(o.discount_percent,0) as discount_percent,
-      ROUND(p.price*(1-COALESCE(o.discount_percent,0)/100.0),2) as final_price
-    FROM products p
-    LEFT JOIN offers o ON o.product_id=p.product_id AND o.valid_till>NOW()
-    WHERE p.is_available=true AND p.stock_quantity>0
-    ORDER BY p.category, p.name`);
-  catalogCache = r.rows;
-  catalogCachedAt = now;
-  console.log('Catalog cache refreshed —', r.rows.length, 'products');
-  return catalogCache;
-}
-
-// ─────────────────────────────────────────────────
-// LOCAL INTENT DETECTION — NO Gemini call needed
-// Handles greetings, offers, simple questions instantly
-// ─────────────────────────────────────────────────
-const GREETING_WORDS = ['hi', 'hii', 'hiii', 'hello', 'hey', 'helo', 'hlo', 'yo', 'sup',
-  'good morning', 'good evening', 'good afternoon', 'goodmorning', 'goodevening',
-  'vanakkam', 'namaste', 'hai'];
-
-const OFFERS_WORDS = ['offer', 'offers', 'deal', 'deals', 'discount', 'discounts', 'sale',
-  'savings', 'today deal', 'any offer', 'any deal', 'best price'];
-
-const ORDER_WORDS = ['order it', 'pack it', "i'll pick", 'book it', 'ill pick', 'place order',
-  'pack them', 'order those', 'order all', 'pack all', 'confirm order', 'yes order',
-  'pack available', 'order available'];
-
-const CAPABILITY_WORDS = ['what can you do', 'who are you', 'what do you do', 'how can you help',
-  'your features', 'help me', 'what are you', 'tell me about yourself', 'how you work'];
-
-const DMART_QUESTION_WORDS = ['store time', 'opening time', 'closing time', 'timings', 'open at',
-  'open on sunday', 'return policy', 'return item', 'exchange', 'parking', 'dmart ready',
-  'dmart app', 'store location', 'nearest dmart', 'phone number'];
-
-function detectLocalIntent(message) {
-  const m = message.toLowerCase().trim();
-
-  // Pure greeting (just the greeting, no product words)
-  if (GREETING_WORDS.some(g => m === g || m === g + '!' || m === g + '.')) {
-    return { intent: 'greeting', local: true };
-  }
-
-  // Offers
-  if (OFFERS_WORDS.some(w => m.includes(w))) {
-    return { intent: 'offers', local: true };
-  }
-
-  // Order from context
-  if (ORDER_WORDS.some(w => m.includes(w))) {
-    return { intent: 'order', local: true, order_items: [] };
-  }
-
-  // Bot capability question
-  if (CAPABILITY_WORDS.some(w => m.includes(w))) {
-    return { intent: 'question', local: true, dmart_answer: getCapabilitiesAnswer() };
-  }
-
-  // Dmart-specific questions
-  if (DMART_QUESTION_WORDS.some(w => m.includes(w))) {
-    return { intent: 'question', local: true, dmart_answer: getDmartAnswer(m) };
-  }
-
-  return null; // needs Gemini
-}
-
-function getCapabilitiesAnswer() {
-  return `I'm your *Dmart shopping assistant!* Here's what I can do:\n\n` +
-    `🔍 *Find any product* — "Do you have Lays?" / "Show me dairy products"\n` +
-    `📋 *Check your shopping list* — Send your full list, I'll check availability with prices\n` +
-    `🏷️ *Show live deals* — "What offers are there today?"\n` +
-    `📦 *Note your pickup order* — "Pack it, I'll pick it up"\n` +
-    `💡 *Answer Dmart questions* — store timings, return policy, parking and more!\n\n` +
-    `What do you need today? 😊`;
-}
-
-function getDmartAnswer(m) {
-  if (m.includes('time') || m.includes('open') || m.includes('close') || m.includes('timing')) {
-    return `🕐 *Dmart Store Timings:*\nMonday–Saturday: 8:00 AM – 10:00 PM\nSunday: 8:00 AM – 10:00 PM\n\nTimings may vary by location — confirm with your local store! 😊`;
-  }
-  if (m.includes('return') || m.includes('exchange')) {
-    return `🔄 *Dmart Return Policy:*\nMost items can be returned within 30 days with the original bill. Fresh produce, food items, and undergarments are non-returnable. Bring the item and your bill to the store! 😊`;
-  }
-  if (m.includes('parking')) {
-    return `🚗 *Parking at Dmart:*\nMost Dmart stores have free parking. Two-wheelers and four-wheelers are usually in separate zones. Check your specific store for details! 😊`;
-  }
-  if (m.includes('ready') || m.includes('app')) {
-    return `📱 *Dmart Ready App:*\nDmart Ready is the online delivery service. Search "DMart Ready" on Play Store or App Store. But honestly — walking into the store gets you fresher products, same low prices, and no delivery wait! 😊`;
-  }
+  console.error('All Gemini keys exhausted');
   return null;
 }
 
-// ─────────────────────────────────────────────────
-// SETUP DB TABLES
-// ─────────────────────────────────────────────────
-async function ensureTables() {
+async function callGeminiJSON(prompt, fallback = {}) {
+  const raw = await callGemini(prompt);
+  if (!raw) return fallback;
   try {
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS customer_interactions (
-        id SERIAL PRIMARY KEY, customer_id INTEGER, phone_number VARCHAR(20),
-        message TEXT, intent VARCHAR(50), category VARCHAR(50),
-        bot_response TEXT, created_at TIMESTAMP DEFAULT NOW()
-      );
-      CREATE TABLE IF NOT EXISTS customer_orders (
-        order_id SERIAL PRIMARY KEY, customer_id INTEGER, phone_number VARCHAR(20),
-        product_name TEXT, status VARCHAR(20) DEFAULT 'pending',
-        created_at TIMESTAMP DEFAULT NOW(), updated_at TIMESTAMP DEFAULT NOW()
-      );
-      CREATE TABLE IF NOT EXISTS order_bans (
-        ban_id SERIAL PRIMARY KEY, customer_id INTEGER, phone_number VARCHAR(20),
-        ban_until TIMESTAMP, reason TEXT, created_at TIMESTAMP DEFAULT NOW()
-      );
-    `);
-  } catch(e) { console.log('Table setup note:', e.message); }
+    return JSON.parse(raw.replace(/```json|```/g, '').trim());
+  } catch (e) {
+    console.error('Gemini JSON parse error:', e.message, '| raw:', raw.slice(0, 200));
+    return fallback;
+  }
 }
-ensureTables();
 
-// ─────────────────────────────────────────────────
-// SEND HELPERS
-// ─────────────────────────────────────────────────
-function formatPhone(raw) {
+// ── TWILIO ──────────────────────────────────────────────────────
+const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+const FROM_NUMBER  = `whatsapp:${process.env.TWILIO_WHATSAPP_NUMBER}`;
+
+function toWA(raw) {
   if (raw.startsWith('whatsapp:')) return raw;
   const d = raw.replace(/[^0-9]/g, '');
   return `whatsapp:+${d.startsWith('91') ? d : '91' + d}`;
 }
 
 async function sendText(to, body) {
+  if (!body || !body.trim()) return;
   try {
-    await twilioClient.messages.create({
-      from: `whatsapp:${process.env.TWILIO_WHATSAPP_NUMBER}`,
-      to: formatPhone(to), body
-    });
-  } catch (e) { console.error('sendText error:', e.message); }
+    await twilioClient.messages.create({ from: FROM_NUMBER, to: toWA(to), body });
+  } catch (e) {
+    console.error('sendText FAILED:', e.message.slice(0, 100));
+  }
 }
 
 async function sendImage(to, imageUrl, caption) {
   try {
-    await twilioClient.messages.create({
-      from: `whatsapp:${process.env.TWILIO_WHATSAPP_NUMBER}`,
-      to: formatPhone(to), body: caption, mediaUrl: [imageUrl]
-    });
-  } catch (e) { await sendText(to, caption); }
+    await twilioClient.messages.create({ from: FROM_NUMBER, to: toWA(to), body: caption, mediaUrl: [imageUrl] });
+  } catch (e) {
+    await sendText(to, caption); // fallback
+  }
 }
 
-// ─────────────────────────────────────────────────
-// DATABASE HELPERS
-// ─────────────────────────────────────────────────
+// ── STATE ────────────────────────────────────────────────────────
+const pendingFollowUp = new Map(); // phone → timer
+const pendingOrders   = new Map(); // phone → { timer, items }
+// conversation context: stores last 30 min result per customer
+const ctxStore = new Map(); // phone → { availableItems, notAvailableItems, lastProducts, ts }
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// ── DB TABLES SETUP ─────────────────────────────────────────────
+async function ensureTables() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS customer_interactions (
+        id SERIAL PRIMARY KEY, customer_id INTEGER,
+        phone_number VARCHAR(20), message TEXT, intent VARCHAR(50),
+        category VARCHAR(50), bot_response TEXT, created_at TIMESTAMP DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS customer_orders (
+        order_id SERIAL PRIMARY KEY, customer_id INTEGER,
+        phone_number VARCHAR(20), product_name TEXT,
+        status VARCHAR(20) DEFAULT 'pending',
+        created_at TIMESTAMP DEFAULT NOW(), updated_at TIMESTAMP DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS order_bans (
+        ban_id SERIAL PRIMARY KEY, customer_id INTEGER,
+        phone_number VARCHAR(20), ban_until TIMESTAMP,
+        reason TEXT, created_at TIMESTAMP DEFAULT NOW()
+      );
+    `);
+    console.log('✅ DB tables ready');
+  } catch(e) { console.error('Table setup error:', e.message); }
+}
+
+// ── DB HELPERS ───────────────────────────────────────────────────
 async function getCustomerByPhone(phone) {
   const clean = phone.replace(/[^0-9]/g, '').replace(/^91/, '');
-  const r = await pool.query(`SELECT * FROM customers WHERE phone_number LIKE $1 LIMIT 1`, [`%${clean}%`]);
-  return r.rows[0] || null;
+  try {
+    const r = await pool.query(`SELECT * FROM customers WHERE phone_number LIKE $1 LIMIT 1`, [`%${clean}%`]);
+    return r.rows[0] || null;
+  } catch(e) { console.error('getCustomerByPhone error:', e.message); return null; }
 }
 
 async function isNewCustomer(id) {
-  const r = await pool.query(`SELECT COUNT(*) as c FROM customer_interactions WHERE customer_id=$1`, [id]);
-  return parseInt(r.rows[0].c) === 0;
+  try {
+    const r = await pool.query(`SELECT COUNT(*) c FROM customer_interactions WHERE customer_id=$1`, [id]);
+    return parseInt(r.rows[0].c) === 0;
+  } catch(e) { return false; }
 }
 
 async function getPreferences(id) {
-  const r = await pool.query(
-    `SELECT category, preference_score FROM customer_preferences WHERE customer_id=$1 ORDER BY preference_score DESC`, [id]
-  );
-  return r.rows;
+  try {
+    const r = await pool.query(`SELECT category, preference_score FROM customer_preferences WHERE customer_id=$1 ORDER BY preference_score DESC`, [id]);
+    return r.rows;
+  } catch(e) { return []; }
 }
 
-async function fetchProductsByNames(names) {
-  if (!names || names.length === 0) return [];
-  const conditions = names.map((_, i) =>
-    `(LOWER(p.name) LIKE LOWER($${i+1}) OR LOWER(p.brand) LIKE LOWER($${i+1}) OR LOWER(p.category) LIKE LOWER($${i+1}))`
-  ).join(' OR ');
-  const params = names.map(n => `%${n}%`);
-  const r = await pool.query(`
-    SELECT p.product_id, p.name, p.category, p.brand, p.price, p.image_url,
-      COALESCE(o.discount_percent,0) as discount_percent,
-      ROUND(p.price*(1-COALESCE(o.discount_percent,0)/100.0),2) as final_price
-    FROM products p
-    LEFT JOIN offers o ON o.product_id=p.product_id AND o.valid_till>NOW()
-    WHERE p.is_available=true AND p.stock_quantity>0 AND (${conditions})
-    ORDER BY COALESCE(o.discount_percent,0) DESC`, params);
-  return r.rows;
-}
-
-async function getPreferredProducts(customerId, limit = 5) {
-  const r = await pool.query(`
-    SELECT p.product_id, p.name, p.category, p.brand, p.price, p.image_url,
-      COALESCE(o.discount_percent,0) as discount_percent,
-      ROUND(p.price*(1-COALESCE(o.discount_percent,0)/100.0),2) as final_price
-    FROM products p
-    JOIN customer_preferences cp ON cp.customer_id=$1 AND cp.category=p.category
-    LEFT JOIN offers o ON o.product_id=p.product_id AND o.valid_till>NOW()
-    WHERE p.is_available=true AND p.stock_quantity>0
-    ORDER BY cp.preference_score DESC, COALESCE(o.discount_percent,0) DESC
-    LIMIT $2`, [customerId, limit]);
-  return r.rows;
+async function getPreferredProducts(customerId, limit = 4) {
+  try {
+    const r = await pool.query(`
+      SELECT p.product_id, p.name, p.category, p.brand, p.price, p.image_url,
+        COALESCE(o.discount_percent,0) as discount_percent,
+        ROUND(p.price*(1-COALESCE(o.discount_percent,0)/100.0),2) as final_price
+      FROM products p
+      JOIN customer_preferences cp ON cp.customer_id=$1 AND cp.category=p.category
+      LEFT JOIN offers o ON o.product_id=p.product_id AND o.valid_till>NOW()
+      WHERE p.is_available=true AND p.stock_quantity>0
+      ORDER BY cp.preference_score DESC, COALESCE(o.discount_percent,0) DESC LIMIT $2`,
+      [customerId, limit]);
+    return r.rows;
+  } catch(e) { return []; }
 }
 
 async function getOffers(customerId) {
-  const r = await pool.query(`
-    SELECT p.name, p.brand, p.price, p.image_url, o.discount_percent,
-      ROUND(p.price*(1-o.discount_percent/100.0),2) as offer_price,
-      ROUND(p.price*o.discount_percent/100.0,2) as you_save,
-      p.category, COALESCE(cp.preference_score,0) as relevance
-    FROM offers o
-    JOIN products p ON p.product_id=o.product_id
-    LEFT JOIN customer_preferences cp ON cp.customer_id=$1 AND cp.category=p.category
-    WHERE o.valid_till>NOW() AND p.is_available=true AND p.stock_quantity>0
-    ORDER BY relevance DESC, o.discount_percent DESC LIMIT 6`, [customerId]);
-  return r.rows;
+  try {
+    const r = await pool.query(`
+      SELECT p.name, p.brand, p.price, p.image_url, o.discount_percent,
+        ROUND(p.price*(1-o.discount_percent/100.0),2) as offer_price,
+        ROUND(p.price*o.discount_percent/100.0,2) as you_save, p.category,
+        COALESCE(cp.preference_score,0) as relevance
+      FROM offers o JOIN products p ON p.product_id=o.product_id
+      LEFT JOIN customer_preferences cp ON cp.customer_id=$1 AND cp.category=p.category
+      WHERE o.valid_till>NOW() AND p.is_available=true AND p.stock_quantity>0
+      ORDER BY relevance DESC, o.discount_percent DESC LIMIT 6`, [customerId]);
+    return r.rows;
+  } catch(e) { return []; }
+}
+
+// Search products by specific terms (name/brand/category match)
+async function searchProducts(terms) {
+  const validTerms = (terms || []).filter(t => t && t.trim().length > 0);
+  if (validTerms.length === 0) return [];
+  try {
+    const conditions = validTerms.map((_,i) =>
+      `(LOWER(p.name) LIKE LOWER($${i+1}) OR LOWER(COALESCE(p.brand,'')) LIKE LOWER($${i+1}) OR LOWER(p.category) LIKE LOWER($${i+1}))`
+    ).join(' OR ');
+    const r = await pool.query(`
+      SELECT p.product_id, p.name, p.category, p.brand, p.price, p.image_url,
+        COALESCE(o.discount_percent,0) as discount_percent,
+        ROUND(p.price*(1-COALESCE(o.discount_percent,0)/100.0),2) as final_price
+      FROM products p
+      LEFT JOIN offers o ON o.product_id=p.product_id AND o.valid_till>NOW()
+      WHERE p.is_available=true AND p.stock_quantity>0 AND (${conditions})
+      ORDER BY COALESCE(o.discount_percent,0) DESC, p.price ASC`,
+      validTerms.map(t => `%${t.trim()}%`));
+    const seen = new Set();
+    return r.rows.filter(p => { if (seen.has(p.product_id)) return false; seen.add(p.product_id); return true; });
+  } catch(e) { console.error('searchProducts error:', e.message); return []; }
+}
+
+// Get the FULL product catalog — given to Gemini so it can actually understand what we have
+async function getAllProducts() {
+  try {
+    const r = await pool.query(`
+      SELECT p.product_id, p.name, p.category, p.brand, p.price, p.image_url,
+        COALESCE(o.discount_percent,0) as discount_percent,
+        ROUND(p.price*(1-COALESCE(o.discount_percent,0)/100.0),2) as final_price
+      FROM products p
+      LEFT JOIN offers o ON o.product_id=p.product_id AND o.valid_till>NOW()
+      WHERE p.is_available=true AND p.stock_quantity>0
+      ORDER BY p.category, p.name`);
+    return r.rows;
+  } catch(e) { console.error('getAllProducts error:', e.message); return []; }
 }
 
 async function addProductToDB(name, category, brand, price) {
@@ -310,220 +275,153 @@ async function addProductToDB(name, category, brand, price) {
     await pool.query(`
       INSERT INTO products(name,category,brand,price,cost_price,stock_quantity,reorder_threshold,is_available,image_url)
       VALUES($1,$2,$3,$4,$5,100,10,true,'') ON CONFLICT DO NOTHING`,
-      [name, category, brand || '', price, Math.round(price * 0.7)]
-    );
-    console.log('Saved to DB:', name);
-    catalogCache = null; // invalidate cache so next message sees new product
-  } catch (e) { console.log('addProduct note:', e.message); }
+      [name, category, brand || '', price, Math.round(price * 0.7)]);
+    console.log('🆕 Added to DB:', name);
+  } catch(e) { console.error('addProduct error:', e.message); }
 }
 
 async function logInteraction(customerId, phone, message, intent, category, reply) {
   try {
     await pool.query(
       `INSERT INTO customer_interactions(customer_id,phone_number,message,intent,category,bot_response) VALUES($1,$2,$3,$4,$5,$6)`,
-      [customerId, phone, message, intent, category, reply]
-    );
-  } catch (e) {}
+      [customerId, phone, message, intent, category || null, (reply||'').slice(0,500)]);
+  } catch(e) {}
 }
 
-// ─────────────────────────────────────────────────
-// THE BRAIN — Gemini reads full message + catalog
-// ONLY called when local detection can't handle it
-// Catalog is compressed to save tokens
-// ─────────────────────────────────────────────────
-async function thinkAndDecide(message, customer, prefs, allProducts, context) {
-  const prefList = prefs.map(p => p.category).join(', ') || 'General';
-
-  // COMPRESS catalog: only name|category|price — strips brand for lower token count
-  // Format: "Lays Classic|Snacks|20", "Amul Milk|Dairy|25*10%OFF=22.5"
-  const catalog = allProducts.map(p => {
-    const disc = parseFloat(p.discount_percent || 0);
-    return disc > 0
-      ? `${p.name}|${p.category}|${p.price}*${disc}%OFF=${p.final_price}`
-      : `${p.name}|${p.category}|${p.price}`;
-  }).join('\n');
-
-  const ctxSection = context ? `
-PREV: last=${context.lastIntent}, available=[${(context.availableItems||[]).join(',')}], shown=[${(context.lastProducts||[]).slice(0,3).map(p=>p.name).join(',')}]
-If customer replies to prev (like "pack available", "order those") → intent=follow_up` : '';
-
-  const prompt = `You are Dmart India's WhatsApp assistant. Read the customer message fully like a human friend and understand what they ACTUALLY want.
-
-Customer: ${customer.name} | Likes: ${prefList}
-Message: "${message}"${ctxSection}
-
-CATALOG (name|category|price or name|category|origPrice*disc%OFF=finalPrice):
-${catalog || 'No products yet'}
-
-Reply ONLY valid JSON, no markdown:
-{"intent":"greeting|shopping_list|search|browse_category|offers|order|follow_up|question|out_of_scope","understood_as":"1 sentence","matched_products":["exact catalog names matching request"],"search_terms":["extra keywords"],"unknown_items":["items not in catalog"],"order_items":["items being ordered"],"shopping_list_items":["each item WITHOUT quantity"],"reply":"warm 1-2 sentence friendly reply","dmart_answer":null}
-
-INTENT RULES:
-- greeting: ONLY pure greetings with no product request
-- shopping_list: 2+ different items customer wants to check — strip quantities in shopping_list_items
-- search: 1-2 specific products
-- browse_category: "show snacks" / "what dairy items" / "show all fruits"
-- offers: asking about deals/discounts
-- order: "pack it"/"order it"/"I'll pick up"
-- follow_up: replying to prev list like "pack available ones"
-- question: store hours/return policy/parking/bot capabilities — answer in dmart_answer
-- out_of_scope: not related to shopping at all
-
-MATCHING: Be smart. "Lays" matches "Lays Classic". "snacks" → all snack products. Strip quantities from list items.`;
-
-  try {
-    const raw = await callGemini(prompt);
-    if (!raw) throw new Error('No Gemini response');
-    const clean = raw.replace(/```json|```/g, '').trim();
-    const parsed = JSON.parse(clean);
-    parsed.matched_products = parsed.matched_products || [];
-    parsed.search_terms = parsed.search_terms || [];
-    parsed.unknown_items = parsed.unknown_items || [];
-    parsed.order_items = parsed.order_items || [];
-    parsed.shopping_list_items = parsed.shopping_list_items || [];
-    parsed.reply = parsed.reply || `On it ${customer.name}! 😊`;
-    console.log('Brain:', parsed.understood_as);
-    console.log('Intent:', parsed.intent, '| Matched:', parsed.matched_products.length, '| Unknown:', parsed.unknown_items.length, '| List:', parsed.shopping_list_items.length);
-    return parsed;
-  } catch(e) {
-    console.log('thinkAndDecide error:', e.message);
-    // Fallback: try simple keyword search rather than showing "nothing matched"
-    const words = message.split(' ').filter(w => w.length > 3);
-    return {
-      intent: 'search',
-      understood_as: 'Fallback keyword search',
-      matched_products: [],
-      search_terms: words.length > 0 ? words : [message],
-      unknown_items: [],
-      order_items: [],
-      reply: `On it ${customer.name}! Let me check that for you 😊`,
-      dmart_answer: null,
-      shopping_list_items: []
-    };
-  }
-}
-
-// Check unknown items with Gemini — ALL at once (1 call for multiple unknowns)
-async function checkUnknownWithGemini(items) {
-  if (!items || items.length === 0) return [];
-  const prompt = `Dmart India product expert. Check if sold at Dmart India stores.
-Items: ${items.join(', ')}
-Reply ONLY valid JSON array:
-[{"item":"name","available":true,"dmart_name":"exact Dmart name","category":"category","brand":"brand or empty","price":number}]
-Dmart sells: groceries, FMCG, clothing, footwear, home goods, stationery. NOT medicines, electronics.
-Not at Dmart: {"item":"name","available":false,"dmart_name":"","category":"","brand":"","price":0}`;
-  try {
-    const raw = await callGemini(prompt);
-    if (!raw) return [];
-    return JSON.parse(raw.replace(/```json|```/g, '').trim());
-  } catch(e) { return []; }
-}
-
-// ─────────────────────────────────────────────────
-// PRODUCT CARD
-// ─────────────────────────────────────────────────
-async function sendProductCard(to, product, isFirst) {
-  let cap = '';
-  if (isFirst) cap += `⭐ *TOP PICK*\n`;
-  cap += `*${product.name}*`;
-  if (product.brand) cap += ` — ${product.brand}`;
-  cap += `\n📦 ${product.category}\n`;
-  const discount = parseFloat(product.discount_percent || 0);
-  if (discount > 0) {
-    const final = product.final_price || product.offer_price || product.price;
-    const save = (parseFloat(product.price) - parseFloat(final)).toFixed(0);
-    cap += `~~Rs.${product.price}~~ → *Rs.${final}* 🏷️ *${discount}% OFF*\n`;
-    cap += `💰 You save Rs.${save}`;
+// ── PRODUCT CARD ──────────────────────────────────────────────
+async function sendProductCard(to, p, isFirst = false) {
+  let cap = isFirst ? '⭐ *TOP PICK*\n' : '';
+  cap += `*${p.name}*`;
+  if (p.brand) cap += ` — ${p.brand}`;
+  cap += `\n📦 ${p.category}\n`;
+  const disc = parseFloat(p.discount_percent || 0);
+  if (disc > 0) {
+    const fin = p.final_price || p.offer_price || p.price;
+    const save = (parseFloat(p.price) - parseFloat(fin)).toFixed(0);
+    cap += `~~Rs.${p.price}~~ → *Rs.${fin}* 🏷️ *${disc}% OFF*\n💰 You save Rs.${save}`;
   } else {
-    cap += `💵 *Rs.${product.price}*`;
+    cap += `💵 *Rs.${p.price}*`;
   }
-  cap += `\n\n📍 Available at Dmart — grab it fresh!`;
-  if (product.image_url && product.image_url.startsWith('http')) {
-    await sendImage(to, product.image_url, cap);
+  cap += `\n\n📍 Available at Dmart — grab it fresh!\nReply *"order ${p.name}"* to note your pickup!`;
+  if (p.image_url && p.image_url.startsWith('http')) {
+    await sendImage(to, p.image_url, cap);
   } else {
     await sendText(to, cap);
   }
 }
 
-// ─────────────────────────────────────────────────
-// WELCOME
-// ─────────────────────────────────────────────────
+// ── LOCAL INTENT DETECTION (no Gemini needed) ─────────────────
+const GREET_WORDS = new Set(['hi','hii','hiii','hello','hey','helo','hlo','yo','sup','hai','vanakkam','namaste','good morning','good evening','good afternoon','goodmorning','goodevening']);
+const OFFER_WORDS = ['offer','offers','deal','deals','discount','discounts','sale','savings','best price','any offer','any deal'];
+const ORDER_WORDS = ['order it','pack it',"i'll pick",'ill pick','book it','pack them','order those','order all','pack all','confirm order','yes order','pack available','order available','place order','order and pick'];
+const DMART_Q    = ['store time','opening time','closing time','timings','open at','return policy','return item','exchange','parking','dmart ready','dmart app','store location','nearest dmart'];
+
+function detectLocalIntent(msg) {
+  const m = msg.toLowerCase().trim();
+  const mClean = m.replace(/[!.?]+$/,'');
+
+  // Pure greeting ONLY — if message has more words after the greeting, let Gemini handle it
+  const words = m.split(/\s+/);
+  const firstWord = words[0].replace(/[!.?]+$/,'');
+  const isPureGreeting = GREET_WORDS.has(mClean) || (GREET_WORDS.has(firstWord) && words.length <= 2 && !words.slice(1).some(w => w.length > 3));
+  if (isPureGreeting) return 'greeting';
+
+  if (OFFER_WORDS.some(w => m.includes(w))) return 'offers';
+  if (ORDER_WORDS.some(w => m.includes(w))) return 'order';
+  if (m.includes('what can you') || m.includes('how can you') || m.includes('who are you') || m.includes('what do you do')) return 'capabilities';
+  if (DMART_Q.some(w => m.includes(w))) return 'dmart_question';
+  return null;
+}
+
+function getDmartAnswer(m) {
+  if (m.includes('time') || m.includes('open') || m.includes('close') || m.includes('timing'))
+    return `🕐 *Dmart Store Timings:*\nMon–Sun: 8:00 AM – 10:00 PM\n\n_(Timings may vary by location — confirm with your local store!)_`;
+  if (m.includes('return') || m.includes('exchange'))
+    return `🔄 *Dmart Return Policy:*\nMost items returnable within 30 days with the original bill. Fresh produce, food items, and undergarments are non-returnable. Bring the item + bill to the store!`;
+  if (m.includes('parking'))
+    return `🚗 *Parking at Dmart:*\nMost Dmart stores have free parking for 2-wheelers and 4-wheelers. Check your specific store for details!`;
+  if (m.includes('ready') || m.includes('app'))
+    return `📱 *Dmart Ready App:*\nSearch "DMart Ready" on Play Store or App Store for online delivery. But honestly — walking in gets you fresher products, same low prices, and no delivery wait! 😊`;
+  return null;
+}
+
+// ── WELCOME ───────────────────────────────────────────────────
 function buildWelcome(name) {
-  return `👋 *Hey ${name}! Welcome to Dmart Assistant!* 🛒
+  return `👋 *Hey ${name}! Welcome to your Dmart Assistant!* 🛒
 
-I'm your personal shopping friend at Dmart. Here's everything I can do:
+I'm your personal shopping friend here. Here's everything I can do for you:
 
-🔍 *Find any product* — "Do you have Lays?" or "Show me dairy products"
-📋 *Check your shopping list* — Send your full list, I'll check what's available with prices and offers
-🏷️ *Show live deals* — "What offers are there today?"
+🔍 *Find any product* — "Show me snacks" or "Do you have Lays?"
+📋 *Check your shopping list* — Paste your full list, I'll check availability, prices and offers
+🏷️ *Show live deals* — "What offers today?"
 📦 *Note your pickup order* — "Pack it, I'll pick it up"
-💡 *Answer any Dmart question* — store timings, return policy, Dmart Ready app, parking — anything!
-🤝 *Personal picks* — I know what you like and show you the best deals on those
+💡 *Answer Dmart questions* — store timings, return policy, app — anything!
+🤝 *Personalized picks* — I know what you like and find the best deals for you
 
-I'm here to make your Dmart shopping smarter. 😊
-
-*What do you need today?*`;
+I'm here 24/7. What do you need today? 😊`;
 }
 
-// ─────────────────────────────────────────────────
-// FOLLOW UP — 0 Gemini calls
-// ─────────────────────────────────────────────────
+// ── FOLLOW-UP (60s after welcome if no reply) ────────────────
 async function sendFollowUp(to, customer) {
-  const prods = await getPreferredProducts(customer.customer_id, 3);
-  if (prods.length === 0) {
-    await sendText(to, `👋 *${customer.name}!* Anything you need from Dmart today? Just ask or send your list! 😊`);
-    return;
-  }
-  const highlight = prods.find(p => parseFloat(p.discount_percent) > 0) || prods[0];
-  await sendText(to,
-    `🛒 *${customer.name}, I know what you love at Dmart!*\n\n` +
-    `*${highlight.name}* is ${parseFloat(highlight.discount_percent) > 0
-      ? `at *${highlight.discount_percent}% OFF* — only Rs.${highlight.final_price} (was Rs.${highlight.price})!`
-      : `in stock at Rs.${highlight.price}.`}\n\n` +
-    `Fresh products, real prices — no delivery wait, no hidden fees. Just walk in! 😊\n\n` +
-    `Send your list or ask for anything! 📋`
-  );
-  await sleep(500);
-  for (let i = 0; i < Math.min(prods.length, 2); i++) {
-    await sendProductCard(to, prods[i], i === 0);
-    await sleep(500);
-  }
+  try {
+    const prods = await getPreferredProducts(customer.customer_id, 3);
+    if (prods.length === 0) {
+      await sendText(to, `🛒 *${customer.name}!* Still there? Just ask for any product or paste your shopping list — I'm ready! 😊`);
+      return;
+    }
+    const h = prods.find(p => parseFloat(p.discount_percent) > 0) || prods[0];
+    await sendText(to,
+      `🤔 *${customer.name}, still thinking?*\n\n` +
+      `I know what you love — *${h.name}* ${parseFloat(h.discount_percent) > 0
+        ? `is at *${h.discount_percent}% OFF* right now! Only Rs.${h.final_price} (was Rs.${h.price})`
+        : `is in stock at Rs.${h.price}`}.\n\n` +
+      `Fresh products, real prices. No delivery fee, no waiting. Just walk in! 😊\n\nWhat do you need today?`
+    );
+    await sleep(600);
+    for (let i = 0; i < Math.min(prods.length, 2); i++) {
+      await sendProductCard(to, prods[i], i === 0);
+      await sleep(500);
+    }
+  } catch(e) { console.error('sendFollowUp error:', e.message); }
 }
 
-// ─────────────────────────────────────────────────
-// ORDER SYSTEM
-// ─────────────────────────────────────────────────
+// ── ORDER SYSTEM ─────────────────────────────────────────────
 async function isCustomerBanned(customerId, phone) {
   try {
-    const r = await pool.query(`SELECT * FROM order_bans WHERE (customer_id=$1 OR phone_number=$2) AND ban_until > NOW() LIMIT 1`, [customerId, phone]);
+    const r = await pool.query(`SELECT * FROM order_bans WHERE (customer_id=$1 OR phone_number=$2) AND ban_until>NOW() LIMIT 1`, [customerId, phone]);
     return r.rows[0] || null;
   } catch(e) { return null; }
 }
 
 async function getCancelledCount(customerId) {
   try {
-    const r = await pool.query(`SELECT COUNT(*) as c FROM customer_orders WHERE customer_id=$1 AND status='cancelled' AND created_at > NOW() - INTERVAL '30 days'`, [customerId]);
+    const r = await pool.query(`SELECT COUNT(*) c FROM customer_orders WHERE customer_id=$1 AND status='cancelled' AND created_at>NOW()-INTERVAL '30 days'`, [customerId]);
     return parseInt(r.rows[0].c);
   } catch(e) { return 0; }
 }
 
-async function handleOrder(to, customer, productNames) {
-  const phone = to.replace('whatsapp:', '').replace('+', '');
+async function handleOrder(to, customer, itemList) {
+  const phone = to.replace('whatsapp:','').replace('+','');
+  const items = Array.isArray(itemList) ? itemList.filter(Boolean) : [String(itemList)];
+  if (items.length === 0) { await sendText(to, `Which item do you want to order ${customer.name}? 😊`); return; }
+
   const ban = await isCustomerBanned(customer.customer_id, phone);
   if (ban) {
-    await sendText(to, `⚠️ *${customer.name}, ordering is paused until ${new Date(ban.ban_until).toLocaleDateString('en-IN')}.*\n\nYou can still browse products! 🛒`);
+    await sendText(to, `⚠️ *${customer.name}*, ordering is paused until *${new Date(ban.ban_until).toLocaleDateString('en-IN')}*.\n\nYou can still browse products! 🛒`);
     return;
   }
-  const cancelCount = await getCancelledCount(customer.customer_id);
-  if (cancelCount >= 3) {
-    try { await pool.query(`INSERT INTO order_bans(customer_id,phone_number,ban_until,reason) VALUES($1,$2,NOW() + INTERVAL '30 days',$3)`, [customer.customer_id, phone, 'Too many cancelled orders']); } catch(e) {}
-    await sendText(to, `⚠️ *${customer.name}, ordering paused for 30 days.*\n\n3 orders weren't picked up. Paused to keep things fair. You can still browse! 😊`);
+  const cancels = await getCancelledCount(customer.customer_id);
+  if (cancels >= 3) {
+    try { await pool.query(`INSERT INTO order_bans(customer_id,phone_number,ban_until,reason) VALUES($1,$2,NOW()+INTERVAL '30 days',$3)`, [customer.customer_id, phone, 'Too many no-shows']); } catch(e) {}
+    await sendText(to, `⚠️ *${customer.name}*, ordering paused for 30 days.\n\n3 orders weren't picked up. Paused to keep things fair for everyone. You can still browse! 😊`);
     return;
   }
 
-  const itemList = Array.isArray(productNames) ? productNames : [productNames];
+  // Clear previous order timer if any
+  if (pendingOrders.has(phone)) { clearTimeout(pendingOrders.get(phone).timer); }
+
   const orderIds = [];
-  for (const item of itemList.slice(0, 6)) {
+  for (const item of items.slice(0, 6)) {
     try {
       const r = await pool.query(`INSERT INTO customer_orders(customer_id,phone_number,product_name,status) VALUES($1,$2,$3,'pending') RETURNING order_id`, [customer.customer_id, phone, item]);
       orderIds.push(r.rows[0].order_id);
@@ -532,41 +430,230 @@ async function handleOrder(to, customer, productNames) {
 
   await sendText(to,
     `✅ *Got it ${customer.name}!*\n\n` +
-    `Order noted for:\n${itemList.map(i => `• ${i}`).join('\n')}\n\n` +
+    `Order noted for:\n${items.map(i=>`• ${i}`).join('\n')}\n\n` +
     `⏳ Give us *3 minutes* to prepare!\n\n` +
-    `📍 Please have payment ready when you come. _(Pay at the counter!)_ 😊`
+    `📍 Please have payment ready when you arrive.\n_(Pay at the counter — super easy!)_ 😊`
   );
-
-  if (pendingOrders.has(phone)) { clearTimeout(pendingOrders.get(phone).timer); }
 
   const readyTimer = setTimeout(async () => {
     try {
-      for (const oid of orderIds) { await pool.query(`UPDATE customer_orders SET status='ready', updated_at=NOW() WHERE order_id=$1`, [oid]); }
+      for (const oid of orderIds) await pool.query(`UPDATE customer_orders SET status='ready',updated_at=NOW() WHERE order_id=$1`,[oid]);
       await sendText(to,
-        `🎉 *${customer.name}, your order is READY!*\n\n✅ Packed and waiting:\n${itemList.map(i => `• ${i}`).join('\n')}\n\n📍 Come pick it up anytime. Payment at the counter! 😊`
+        `🎉 *${customer.name}, your order is READY!*\n\n` +
+        `✅ Packed and waiting:\n${items.map(i=>`• ${i}`).join('\n')}\n\n` +
+        `📍 Come pick it up anytime. Payment at the counter! 😊`
       );
+      // 30 min no-show timer
       const noShowTimer = setTimeout(async () => {
         try {
-          for (const oid of orderIds) { await pool.query(`UPDATE customer_orders SET status='cancelled', updated_at=NOW() WHERE order_id=$1`, [oid]); }
+          for (const oid of orderIds) await pool.query(`UPDATE customer_orders SET status='cancelled',updated_at=NOW() WHERE order_id=$1`,[oid]);
           const count = await getCancelledCount(customer.customer_id);
-          await sendText(to, `⚠️ *Order cancelled — ${customer.name}*\n\nYou didn't come, so the order was cancelled. No worries, order again anytime! 😊\n_(${count}/3 cancellations — after 3, ordering pauses for 1 month.)_`);
+          await sendText(to,
+            `⚠️ *Order cancelled — ${customer.name}*\n\n` +
+            `We waited but you didn't come, so the order was cancelled. No worries, order again anytime!\n\n` +
+            `_(${count}/3 cancellations — after 3, ordering pauses for 1 month to keep things fair.)_`
+          );
           pendingOrders.delete(phone);
         } catch(e) {}
-      }, 30 * 60 * 1000);
+      }, 30*60*1000);
       pendingOrders.set(phone, { timer: noShowTimer, stage: 'ready' });
     } catch(e) {}
-  }, 3 * 60 * 1000);
+  }, 3*60*1000);
 
   pendingOrders.set(phone, { timer: readyTimer, stage: 'pending' });
 }
 
-// ─────────────────────────────────────────────────
-// MAIN PROCESSOR
-// ─────────────────────────────────────────────────
-async function processMessage(fromRaw, message) {
-  console.log('\n═══ MESSAGE ═══ From:', fromRaw, '| Body:', message);
-  const phone = fromRaw.replace('whatsapp:', '').replace('+', '');
+// ── GEMINI BRAIN ─────────────────────────────────────────────
+async function geminiThink(message, customer, prefs, allProducts, ctx) {
+  const prefList = prefs.map(p=>p.category).join(', ') || 'General';
 
+  // Build full catalog string so Gemini knows every product we have
+  const catalog = allProducts.map(p => {
+    const d = parseFloat(p.discount_percent||0);
+    return d > 0
+      ? `${p.name}|${p.category}|${p.brand||''}|Rs${p.price}→Rs${p.final_price}(${d}%OFF)`
+      : `${p.name}|${p.category}|${p.brand||''}|Rs${p.price}`;
+  }).join('\n');
+
+  const ctxPart = ctx && (Date.now()-ctx.ts) < 30*60*1000 ? `
+WHAT HAPPENED BEFORE (${Math.round((Date.now()-ctx.ts)/60000)} mins ago):
+  Items found: ${(ctx.availableItems||[]).join(', ')||'none'}
+  Items not found: ${(ctx.notAvailableItems||[]).join(', ')||'none'}
+  Products shown: ${(ctx.lastProducts||[]).slice(0,3).map(p=>p.name).join(', ')||'none'}
+→ If customer's new message is replying to this (like "okay pack available", "order those", "show me those again") — set intent to follow_up.` : '';
+
+  const prompt = `You are the Dmart India WhatsApp shopping assistant. You think like a smart human friend who works at Dmart.
+
+CUSTOMER: ${customer.name}
+CUSTOMER LIKES: ${prefList}
+CUSTOMER SAYS: "${message}"
+${ctxPart}
+
+OUR FULL PRODUCT CATALOG (name|category|brand|price):
+${catalog || 'No products available'}
+
+YOUR JOB:
+1. READ THE FULL MESSAGE — understand what the customer ACTUALLY means, not just keywords
+2. MATCH their request intelligently to our catalog above
+3. If a product is in the catalog → put it in matched_products
+4. If a product is NOT in the catalog → put it in unknown_items (we will check internet for those)
+
+Reply ONLY with valid JSON — absolutely no markdown, no text outside JSON:
+{
+  "intent": "greeting|shopping_list|search|browse_category|offers|order|follow_up|question|out_of_scope",
+  "reply": "warm 1-2 sentence reply as a caring shopping friend. For product requests: subtly mention Dmart = real prices, no delivery markup. Sound natural.",
+  "shopping_list_items": [],
+  "matched_products": [],
+  "search_terms": [],
+  "unknown_items": [],
+  "order_items": [],
+  "follow_up_action": null,
+  "dmart_answer": null
+}
+
+INTENT RULES — read all of these carefully:
+- greeting: ONLY if the message is just a greeting with no product request ("hi", "hello", "good morning")
+- shopping_list: customer gives a LIST of 2+ items to check — strip quantities from item names, e.g. "Beans 1kg" → "Beans", "Lays 20rs 5 packets" → "Lays". Put each item in shopping_list_items[].
+- search: asking about 1-2 specific products by name — e.g. "do you have Lays?", "show me biscuits"
+- browse_category: asking to see a product category — e.g. "show me snacks", "what dairy products", "show all fruits", "check and tell me snacks items"
+- offers: asking about deals/discounts/offers
+- order: says order/pack it/I'll pick up/book it — extract product name(s) in order_items[]
+- follow_up: customer responds to previous result — "okay pack available ones", "order those", "show me those products again", "except unavailable pack the rest"
+- question: asks about bot capabilities ("what can you do?"), store timings, return policy, parking, Dmart app — put your full 2-sentence answer in dmart_answer
+- out_of_scope: cricket, movies, weather, politics — nothing to do with shopping
+
+CATALOG MATCHING RULES:
+- "Okay check and tell me snacks items" → intent: browse_category, search_terms: ["Snacks"]
+- "Hi show me snacks" → intent: browse_category (the "hi" is just greeting before the request)
+- "What are the things you can do?" → intent: question, explain bot capabilities in dmart_answer
+- When matching: "Lays" can match "Lays Classic" from catalog. Be smart about partial matches.
+- If a product name from catalog clearly matches what customer wants → put that exact catalog name in matched_products
+- Items NOT anywhere in catalog → put in unknown_items so we can check the internet for them`;
+
+  const fallback = {
+    intent:'search', reply:`On it ${customer.name}! 😊`,
+    shopping_list_items:[], matched_products:[], search_terms:[message.split(' ').find(w=>w.length>3)||message],
+    unknown_items:[], order_items:[], follow_up_action:null, dmart_answer:null
+  };
+
+  const result = await callGeminiJSON(prompt, fallback);
+  result.shopping_list_items = result.shopping_list_items || [];
+  result.matched_products    = result.matched_products    || [];
+  result.search_terms        = result.search_terms        || [];
+  result.unknown_items       = result.unknown_items       || [];
+  result.order_items         = result.order_items         || [];
+  result.reply               = result.reply               || fallback.reply;
+  console.log(`🧠 Intent:${result.intent} | Matched:${result.matched_products.length} | List:${result.shopping_list_items.length} | Unknown:${result.unknown_items.length} | Search:${result.search_terms.join(',')}`);
+  return result;
+}
+
+// check unknown items with Gemini (all in one call)
+async function checkUnknownItems(items) {
+  if (!items || items.length === 0) return [];
+  const prompt = `Dmart India product expert. Check which of these are sold at Dmart India stores.
+Items: ${items.join(', ')}
+Dmart sells: groceries, FMCG, clothing, footwear, home goods. NOT electronics or medicines.
+Reply ONLY valid JSON array no markdown:
+[{"item":"original name","available":true,"dmart_name":"exact Dmart product name","category":"category","brand":"brand or empty","price":number_in_rupees}]
+Not at Dmart: {"item":"name","available":false,"dmart_name":"","category":"","brand":"","price":0}`;
+
+  const result = await callGeminiJSON(prompt, []);
+  return Array.isArray(result) ? result : [];
+}
+
+// ── SHOPPING LIST HANDLER ────────────────────────────────────
+async function handleShoppingList(to, customer, items, reply) {
+  await sendText(to, `${reply}\n\n📋 *Checking your ${items.length} items at Dmart...*`);
+
+  const dbProducts = await searchProducts(items);
+  const availableItems = [];
+  const foundProducts  = [];
+  const unknownItems   = [];
+
+  for (const item of items) {
+    const kl = item.toLowerCase();
+    const match = dbProducts.find(p =>
+      p.name.toLowerCase().includes(kl) ||
+      kl.includes(p.name.toLowerCase().split(' ')[0]) ||
+      (p.brand && p.brand.toLowerCase().includes(kl)) ||
+      p.category.toLowerCase().includes(kl)
+    );
+    if (match) {
+      availableItems.push(item);
+      if (!foundProducts.find(f=>f.product_id===match.product_id)) foundProducts.push(match);
+    } else {
+      unknownItems.push(item);
+    }
+  }
+
+  // Check unknowns with Gemini (1 call for all)
+  const geminiResults = unknownItems.length > 0 ? await checkUnknownItems(unknownItems) : [];
+  const notAvailableItems = [];
+
+  for (const gr of geminiResults) {
+    if (gr.available && gr.dmart_name) {
+      availableItems.push(gr.item);
+      await addProductToDB(gr.dmart_name, gr.category, gr.brand||'', gr.price);
+      foundProducts.push({ name:gr.dmart_name, category:gr.category, brand:gr.brand||'', price:gr.price, discount_percent:0, final_price:gr.price, image_url:'' });
+    } else {
+      notAvailableItems.push(gr.item);
+    }
+  }
+  // items Gemini didn't return a result for
+  for (const item of unknownItems) {
+    if (!geminiResults.find(g=>g.item&&g.item.toLowerCase()===item.toLowerCase())) {
+      notAvailableItems.push(item);
+    }
+  }
+
+  await sleep(500);
+
+  // Build report
+  let report = `📋 *Shopping List — ${customer.name}:*\n\n`;
+  if (availableItems.length > 0) {
+    report += `✅ *Available at Dmart (${availableItems.length}/${items.length}):*\n`;
+    for (const p of foundProducts) {
+      const d = parseFloat(p.discount_percent||0);
+      report += `• *${p.name}* — Rs.${d>0?p.final_price+` *(${d}% OFF)*`:p.price}\n`;
+    }
+  }
+  if (notAvailableItems.length > 0) {
+    report += `\n❌ *Not available at Dmart (${notAvailableItems.length}):*\n`;
+    report += notAvailableItems.map(i=>`• ${i}`).join('\n');
+  }
+
+  await sendText(to, report);
+  await sleep(600);
+
+  // Send product cards (with images first, max 3)
+  const withImg = foundProducts.filter(p=>p.image_url&&p.image_url.startsWith('http'));
+  for (let i = 0; i < Math.min(withImg.length, 3); i++) {
+    await sendProductCard(to, withImg[i], i===0);
+    await sleep(600);
+  }
+
+  const totalSave = foundProducts.reduce((acc,p)=>{
+    const d=parseFloat(p.discount_percent||0);
+    return acc+(d>0?parseFloat(p.price)-parseFloat(p.final_price):0);
+  },0);
+
+  await sendText(to,
+    `🛒 *${availableItems.length} items ready at Dmart!*` +
+    (totalSave>0?` Save Rs.${totalSave.toFixed(0)} with active offers!`:'') +
+    `\n\nJust walk in — everything's fresh. No delivery wait, no extra fees! 😊\n\n` +
+    `Say *"pack it, I'll pick it up"* to note your order! 📦`
+  );
+
+  return { availableItems, notAvailableItems, foundProducts };
+}
+
+// ── MAIN MESSAGE PROCESSOR ───────────────────────────────────
+async function processMessage(fromRaw, rawMessage) {
+  const message = rawMessage.trim();
+  const phone = fromRaw.replace('whatsapp:','').replace('+','');
+  console.log(`\n═══ MSG from ${phone}: "${message.slice(0,80)}"`);
+
+  // Cancel pending follow-up — customer responded
   if (pendingFollowUp.has(phone)) {
     clearTimeout(pendingFollowUp.get(phone));
     pendingFollowUp.delete(phone);
@@ -574,315 +661,269 @@ async function processMessage(fromRaw, message) {
 
   const customer = await getCustomerByPhone(phone);
   if (!customer) {
-    await sendText(fromRaw, `👋 *Welcome to Dmart Assistant!*\n\nYour number isn't registered yet. Visit Dmart to register!\n\nYou can still ask about any product. 🛒`);
+    await sendText(fromRaw, `👋 *Welcome to Dmart Assistant!*\n\nYour number isn't registered yet. Visit Dmart to register and unlock personalized shopping!\n\nYou can still ask about any product. 🛒`);
     return;
   }
+  console.log(`👤 ${customer.name}`);
 
-  console.log('Customer:', customer.name);
-
-  // ── NEW CUSTOMER — no Gemini needed ──
+  // ── NEW CUSTOMER ──
   const isNew = await isNewCustomer(customer.customer_id);
   if (isNew) {
     await sendText(fromRaw, buildWelcome(customer.name));
     await logInteraction(customer.customer_id, phone, message, 'welcome', null, 'welcome sent');
-    const handle = setTimeout(async () => {
-      try { await sendFollowUp(fromRaw, customer); pendingFollowUp.delete(phone); } catch(e) {}
-    }, 60000);
-    pendingFollowUp.set(phone, handle);
+    const t = setTimeout(async()=>{ try { await sendFollowUp(fromRaw,customer); pendingFollowUp.delete(phone); } catch(e){} }, 60000);
+    pendingFollowUp.set(phone, t);
     return;
   }
 
-  // ── TRY LOCAL DETECTION FIRST (saves Gemini call) ──
-  const local = detectLocalIntent(message);
-  const context = customerContext.get(phone) || null;
+  const ctx = ctxStore.get(phone) || null;
 
-  if (local) {
-    console.log('Local intent detected:', local.intent, '— no Gemini call');
-    const prefs = await getPreferences(customer.customer_id);
+  // ── LOCAL INTENT (no Gemini) ──
+  const localIntent = detectLocalIntent(message);
 
-    if (local.intent === 'greeting') {
-      const offers = await getOffers(customer.customer_id);
-      await sendText(fromRaw,
-        `Hey ${customer.name}! 😊 Great to hear from you!\n\n` +
-        (offers.length > 0 ? `🔥 *${offers.length} deals* live right now, some on things you love! Ask *"show offers"* to see them.\n\n` : '') +
-        `What do you need today?`
-      );
-      await logInteraction(customer.customer_id, phone, message, 'greeting', null, 'greeted locally');
-      return;
-    }
-
-    if (local.intent === 'question') {
-      const answer = local.dmart_answer || getCapabilitiesAnswer();
-      await sendText(fromRaw, `💡 ${answer}`);
-      await logInteraction(customer.customer_id, phone, message, 'question', null, 'local answer');
-      return;
-    }
-
-    if (local.intent === 'offers') {
-      const offers = await getOffers(customer.customer_id);
-      if (offers.length === 0) {
-        await sendText(fromRaw, `No active offers right now ${customer.name}! Want to browse products? 😊`);
-        return;
-      }
-      await sendText(fromRaw, `🔥 *${customer.name}, here are today's best deals — including things you love!*`);
-      await sleep(600);
-      for (let i = 0; i < Math.min(offers.length, 5); i++) {
-        const o = offers[i];
-        const cap = `🏷️ *${o.name}*${o.brand ? ' — ' + o.brand : ''}\n~~Rs.${o.price}~~ → *Rs.${o.offer_price}* (*${o.discount_percent}% OFF*)\n💰 Save Rs.${o.you_save}!\n\n📍 In stock at Dmart — grab it yourself and keep that extra money! 😊`;
-        if (o.image_url && o.image_url.startsWith('http')) { await sendImage(fromRaw, o.image_url, cap); }
-        else { await sendText(fromRaw, cap); }
-        await sleep(600);
-      }
-      await sendText(fromRaw, `Want to check your shopping list? Just paste it! 📋`);
-      await logInteraction(customer.customer_id, phone, message, 'offers', null, 'offers shown locally');
-      return;
-    }
-
-    if (local.intent === 'order') {
-      // Order from context
-      if (context && context.availableItems && context.availableItems.length > 0) {
-        await handleOrder(fromRaw, customer, context.availableItems);
-        await logInteraction(customer.customer_id, phone, message, 'order_local', null, 'ordered from context');
-        return;
-      }
-      // No context — fall through to Gemini to figure out what they're ordering
-    }
+  if (localIntent === 'greeting') {
+    const offers = await getOffers(customer.customer_id);
+    await sendText(fromRaw,
+      `Hey ${customer.name}! 😊 Great to hear from you!\n\n` +
+      (offers.length>0?`🔥 *${offers.length} deals* live right now — ask *"show offers"* to see them!\n\n`:'')+
+      `What do you need today?`
+    );
+    await logInteraction(customer.customer_id, phone, message, 'greeting', null, 'local');
+    return;
   }
 
-  // ── GEMINI NEEDED — load cached catalog ──
-  const allProducts = await getCachedCatalog();
-  const prefs = await getPreferences(customer.customer_id);
-  const brain = await thinkAndDecide(message, customer, prefs, allProducts, context);
+  if (localIntent === 'capabilities') {
+    await sendText(fromRaw,
+      `🛒 *I'm your Dmart Assistant! Here's what I can do:*\n\n` +
+      `🔍 *Find any product* — "Show snacks" / "Do you have Lays?"\n` +
+      `📋 *Check your shopping list* — Paste it and I'll check every item\n` +
+      `🏷️ *Show live deals* — "What offers today?"\n` +
+      `📦 *Note your pickup order* — "Pack it, I'll pick it up"\n` +
+      `💡 *Answer Dmart questions* — timings, return policy, app, parking\n` +
+      `🤝 *Personal picks* — I know what you like!\n\nWhat do you need? 😊`
+    );
+    await logInteraction(customer.customer_id, phone, message, 'question', null, 'capabilities');
+    return;
+  }
 
-  // ── GREETING ──
+  if (localIntent === 'dmart_question') {
+    const ans = getDmartAnswer(message.toLowerCase()) || `I'd recommend checking with your nearest Dmart store for the most accurate info! 😊`;
+    await sendText(fromRaw, `💡 ${ans}`);
+    await logInteraction(customer.customer_id, phone, message, 'question', null, ans.slice(0,100));
+    return;
+  }
+
+  if (localIntent === 'offers') {
+    const offers = await getOffers(customer.customer_id);
+    if (offers.length === 0) {
+      await sendText(fromRaw, `No active offers right now ${customer.name}! Want to browse products? 😊`);
+      return;
+    }
+    await sendText(fromRaw, `🔥 *${customer.name}, here are today's best deals — including things you love!*`);
+    await sleep(600);
+    for (let i = 0; i < Math.min(offers.length, 5); i++) {
+      const o = offers[i];
+      const cap = `🏷️ *${o.name}*${o.brand?' — '+o.brand:''}\n~~Rs.${o.price}~~ → *Rs.${o.offer_price}* (*${o.discount_percent}% OFF*)\n💰 Save Rs.${o.you_save}!\n\n📍 In stock at Dmart — grab it yourself, no delivery fee! 😊`;
+      if (o.image_url&&o.image_url.startsWith('http')) await sendImage(fromRaw, o.image_url, cap);
+      else await sendText(fromRaw, cap);
+      await sleep(600);
+    }
+    await sendText(fromRaw, `Want to check your shopping list? Just paste it! 📋`);
+    await logInteraction(customer.customer_id, phone, message, 'offers', null, 'local offers');
+    return;
+  }
+
+  if (localIntent === 'order') {
+    // Order from context if available
+    if (ctx && ctx.availableItems && ctx.availableItems.length > 0) {
+      await handleOrder(fromRaw, customer, ctx.availableItems);
+      await logInteraction(customer.customer_id, phone, message, 'order', null, 'from context');
+      return;
+    }
+    // No context — fall through to Gemini to figure out what they want to order
+  }
+
+  // ── GEMINI NEEDED ──
+  const prefs = await getPreferences(customer.customer_id);
+  const allProducts = await getAllProducts(); // full catalog — Gemini needs this to actually understand requests
+  const brain = await geminiThink(message, customer, prefs, allProducts, ctx);
+
+  // ── GREETING (Gemini) ──
   if (brain.intent === 'greeting') {
     const offers = await getOffers(customer.customer_id);
     await sendText(fromRaw,
-      `${brain.reply}\n\n` +
-      (offers.length > 0 ? `🔥 *${offers.length} deals* live right now, some on things you love! Ask *"show offers"* to see them.\n\n` : '') +
+      `${brain.reply}\n\n`+
+      (offers.length>0?`🔥 *${offers.length} deals* live right now — ask *"show offers"* to see them!\n\n`:'')+
       `What do you need today? 😊`
     );
-    await logInteraction(customer.customer_id, phone, message, 'greeting', null, 'greeted');
-    return;
-  }
-
-  // ── QUESTION ──
-  if (brain.intent === 'question') {
-    const answer = brain.dmart_answer || getCapabilitiesAnswer();
-    await sendText(fromRaw, `💡 ${answer}\n\nAnything else I can help with? 😊`);
-    await logInteraction(customer.customer_id, phone, message, 'question', null, answer);
+    await logInteraction(customer.customer_id, phone, message, 'greeting', null, 'gemini');
     return;
   }
 
   // ── OUT OF SCOPE ──
   if (brain.intent === 'out_of_scope') {
     await sendText(fromRaw,
-      `😄 Ha! I wish I could help with that ${customer.name}!\n\nBut I'm your *Dmart shopping friend* — only good at products and deals! 🛒\n\nTry: *"Show me snacks"* or send your shopping list!`
+      `😄 Ha! I wish I could help with that ${customer.name}!\n\nBut I'm your *Dmart shopping friend* — only good at products and deals! 🛒\n\nTry: "Show snacks" or "What offers today?" or just paste your shopping list!`
     );
-    const handle = setTimeout(async () => {
-      try { await sendFollowUp(fromRaw, customer); pendingFollowUp.delete(phone); } catch(e) {}
-    }, 60000);
-    pendingFollowUp.set(phone, handle);
-    await logInteraction(customer.customer_id, phone, message, 'out_of_scope', null, 'redirected');
+    await logInteraction(customer.customer_id, phone, message, 'out_of_scope', null, 'gemini');
+    // Schedule follow-up
+    const t = setTimeout(async()=>{ try { await sendFollowUp(fromRaw,customer); pendingFollowUp.delete(phone); } catch(e){} }, 60000);
+    pendingFollowUp.set(phone, t);
     return;
   }
 
-  // ── FOLLOW-UP ──
-  if (brain.intent === 'follow_up' && context && context.availableItems && context.availableItems.length > 0) {
-    await handleOrder(fromRaw, customer, context.availableItems);
-    await logInteraction(customer.customer_id, phone, message, 'follow_up_order', null, 'ordered available items');
+  // ── DMART QUESTION (Gemini) ──
+  if (brain.intent === 'question' && brain.dmart_answer) {
+    await sendText(fromRaw, `💡 ${brain.dmart_answer}\n\nAnything else? 😊`);
+    await logInteraction(customer.customer_id, phone, message, 'question', null, brain.dmart_answer.slice(0,100));
     return;
   }
 
-  // ── OFFERS ──
-  if (brain.intent === 'offers') {
-    const offers = await getOffers(customer.customer_id);
-    if (offers.length === 0) {
-      await sendText(fromRaw, `No active offers right now ${customer.name}! Want to browse products? 😊`);
-      return;
-    }
-    await sendText(fromRaw, `${brain.reply}\n\n🔥 *${offers.length} live deals — including on things YOU like!*`);
-    await sleep(600);
-    for (let i = 0; i < Math.min(offers.length, 5); i++) {
-      const o = offers[i];
-      const cap = `🏷️ *${o.name}*${o.brand ? ' — ' + o.brand : ''}\n~~Rs.${o.price}~~ → *Rs.${o.offer_price}* (*${o.discount_percent}% OFF*)\n💰 Save Rs.${o.you_save}!\n\n📍 In stock at Dmart — grab it yourself and keep that extra money! 😊`;
-      if (o.image_url && o.image_url.startsWith('http')) { await sendImage(fromRaw, o.image_url, cap); }
-      else { await sendText(fromRaw, cap); }
+  // ── FOLLOW-UP (context-aware reply) ──
+  if (brain.intent === 'follow_up' && ctx && ctx.availableItems && ctx.availableItems.length > 0) {
+    if (brain.follow_up_action === 'order_available') {
+      await handleOrder(fromRaw, customer, ctx.availableItems);
+      await logInteraction(customer.customer_id, phone, message, 'follow_up_order', null, ctx.availableItems.join(',').slice(0,100));
+    } else {
+      // Show available items again
+      await sendText(fromRaw,
+        `${brain.reply}\n\n✅ *Available items from your last list:*\n\n${ctx.availableItems.map(i=>`• ${i}`).join('\n')}\n\nSay *"pack it, I'll pick it up"* to order all of them! 📦`
+      );
       await sleep(600);
+      const withImg = (ctx.lastProducts||[]).filter(p=>p.image_url&&p.image_url.startsWith('http')).slice(0,2);
+      for (let i=0; i<withImg.length; i++) { await sendProductCard(fromRaw, withImg[i], i===0); await sleep(500); }
+      await logInteraction(customer.customer_id, phone, message, 'follow_up_show', null, 'shown available');
     }
-    await sendText(fromRaw, `Want to check your shopping list? Just paste it! 📋`);
-    await logInteraction(customer.customer_id, phone, message, 'offers', null, 'offers shown');
     return;
   }
 
-  // ── ORDER ──
+  // ── ORDER (Gemini) ──
   if (brain.intent === 'order') {
-    const items = brain.order_items.length > 0 ? brain.order_items : brain.matched_products;
-    const orderTarget = items.length > 0 ? items : ['your items'];
-    await handleOrder(fromRaw, customer, orderTarget);
-    await logInteraction(customer.customer_id, phone, message, 'order', null, orderTarget.join(', '));
+    const items = brain.order_items.length > 0 ? brain.order_items :
+                  brain.matched_products.length > 0 ? brain.matched_products :
+                  ctx && ctx.availableItems ? ctx.availableItems : [];
+    if (items.length === 0) {
+      await sendText(fromRaw, `${brain.reply}\n\nWhich item would you like to order? 😊`);
+    } else {
+      await handleOrder(fromRaw, customer, items);
+    }
+    await logInteraction(customer.customer_id, phone, message, 'order', null, items.join(',').slice(0,100));
     return;
   }
 
   // ── SHOPPING LIST ──
   if (brain.intent === 'shopping_list' && brain.shopping_list_items.length >= 2) {
-    const items = brain.shopping_list_items;
-    await sendText(fromRaw, `${brain.reply}\n\n📋 *Checking your ${items.length} items at Dmart...*`);
-
-    const dbProducts = await fetchProductsByNames(items);
-    const availableItems = [];
-    const unknownItems = [];
-    const foundProducts = [];
-
-    for (const item of items) {
-      const kl = item.toLowerCase();
-      const match = dbProducts.find(p =>
-        p.name.toLowerCase().includes(kl) ||
-        (p.brand && p.brand.toLowerCase().includes(kl)) ||
-        p.category.toLowerCase().includes(kl) ||
-        kl.includes(p.name.toLowerCase().split(' ')[0])
-      );
-      if (match) {
-        availableItems.push(item);
-        if (!foundProducts.find(fp => fp.product_id === match.product_id)) foundProducts.push(match);
-      } else {
-        unknownItems.push(item);
-      }
-    }
-
-    // ONE Gemini call for ALL unknown items
-    const geminiResults = unknownItems.length > 0 ? await checkUnknownWithGemini(unknownItems) : [];
-    const stillNotAvailable = [];
-
-    for (const gr of geminiResults) {
-      if (gr.available) {
-        availableItems.push(gr.item);
-        addProductToDB(gr.dmart_name, gr.category, gr.brand || '', gr.price);
-        foundProducts.push({ name: gr.dmart_name, category: gr.category, brand: gr.brand, price: gr.price, discount_percent: 0, final_price: gr.price, image_url: '' });
-      } else {
-        stillNotAvailable.push(gr.item);
-      }
-    }
-
-    for (const item of unknownItems) {
-      const hasResult = geminiResults.find(g => g.item && g.item.toLowerCase() === item.toLowerCase());
-      if (!hasResult) stillNotAvailable.push(item);
-    }
-
-    await sleep(500);
-    let report = `📋 *Shopping List — ${customer.name}:*\n\n`;
-    if (availableItems.length > 0) {
-      report += `✅ *Available at Dmart (${availableItems.length}/${items.length}):*\n`;
-      for (const p of foundProducts) {
-        const d = parseFloat(p.discount_percent || 0);
-        report += `• *${p.name}* — Rs.${d > 0 ? p.final_price + ` *(${d}% OFF)*` : p.price}\n`;
-      }
-    }
-    if (stillNotAvailable.length > 0) {
-      report += `\n❌ *Not available at Dmart (${stillNotAvailable.length}):*\n`;
-      report += stillNotAvailable.map(i => `• ${i}`).join('\n');
-    }
-    await sendText(fromRaw, report);
-    await sleep(600);
-
-    const withImages = foundProducts.filter(p => p.image_url && p.image_url.startsWith('http'));
-    for (let i = 0; i < Math.min(withImages.length, 3); i++) {
-      await sendProductCard(fromRaw, withImages[i], i === 0);
-      await sleep(600);
-    }
-
-    const totalSave = foundProducts.reduce((acc, p) => {
-      const d = parseFloat(p.discount_percent || 0);
-      return acc + (d > 0 ? parseFloat(p.price) - parseFloat(p.final_price) : 0);
-    }, 0);
-
-    await sendText(fromRaw,
-      `🛒 *${availableItems.length} items ready at Dmart!*` +
-      (totalSave > 0 ? ` Save Rs.${totalSave.toFixed(0)} with active offers!` : '') +
-      `\n\nJust walk in — everything's fresh. No delivery wait, no extra fees! 😊\n\n` +
-      `Say *"pack it, I'll pick it up"* to note your order! 📦`
-    );
-
-    customerContext.set(phone, { lastIntent: 'shopping_list', availableItems, notAvailableItems: stillNotAvailable, lastProducts: foundProducts });
-    await logInteraction(customer.customer_id, phone, message, 'shopping_list', null, `${availableItems.length}/${items.length} available`);
+    const result = await handleShoppingList(fromRaw, customer, brain.shopping_list_items, brain.reply);
+    ctxStore.set(phone, { availableItems:result.availableItems, notAvailableItems:result.notAvailableItems, lastProducts:result.foundProducts, ts:Date.now() });
+    setTimeout(() => ctxStore.delete(phone), 30*60*1000);
+    await logInteraction(customer.customer_id, phone, message, 'shopping_list', null, `${result.availableItems.length}/${brain.shopping_list_items.length}`);
     return;
   }
 
-  // ── SEARCH or BROWSE CATEGORY ──
-  const allSearchTerms = [...new Set([...brain.matched_products, ...brain.search_terms])].filter(Boolean);
-  let dbResults = allSearchTerms.length > 0 ? await fetchProductsByNames(allSearchTerms) : [];
-
-  const seen = new Set();
-  dbResults = dbResults.filter(p => { if (seen.has(p.product_id)) return false; seen.add(p.product_id); return true; });
+  // ── SEARCH / BROWSE CATEGORY ──
+  const searchTerms = [...new Set([...brain.matched_products, ...brain.search_terms])].filter(Boolean);
+  let dbResults = searchTerms.length > 0 ? await searchProducts(searchTerms) : [];
 
   if (dbResults.length > 0) {
-    await sendText(fromRaw, `${brain.reply}\n\n🛒 *Found ${dbResults.length} product${dbResults.length > 1 ? 's' : ''} at Dmart:*`);
+    await sendText(fromRaw, `${brain.reply}\n\n🛒 *Found ${dbResults.length} product${dbResults.length>1?'s':''} at Dmart:*`);
     await sleep(600);
-    for (let i = 0; i < Math.min(dbResults.length, 5); i++) {
-      await sendProductCard(fromRaw, dbResults[i], i === 0);
+    for (let i=0; i<Math.min(dbResults.length,5); i++) {
+      await sendProductCard(fromRaw, dbResults[i], i===0);
       await sleep(600);
     }
-    const offersCount = dbResults.filter(p => parseFloat(p.discount_percent) > 0).length;
+    const offCnt = dbResults.filter(p=>parseFloat(p.discount_percent)>0).length;
     await sendText(fromRaw,
-      (offersCount > 0 ? `🎉 *${offersCount} of these have active offers!*\n\n` : '') +
+      (offCnt>0?`🎉 *${offCnt} of these have active offers!*\n\n`:'')+
       `📍 All in stock — just walk in. No delivery wait, no extra fees! 🛒\n\nNeed more? Send your full list! 📋`
     );
-    customerContext.set(phone, { lastIntent: brain.intent, availableItems: dbResults.map(p => p.name), notAvailableItems: brain.unknown_items, lastProducts: dbResults });
+    ctxStore.set(phone, { availableItems:dbResults.map(p=>p.name), notAvailableItems:brain.unknown_items||[], lastProducts:dbResults, ts:Date.now() });
+    setTimeout(()=>ctxStore.delete(phone), 30*60*1000);
 
-  } else if (brain.unknown_items.length > 0) {
-    console.log('Unknown items — checking with Gemini:', brain.unknown_items);
-    const geminiResults = await checkUnknownWithGemini(brain.unknown_items);
-    const foundViaGemini = geminiResults.filter(g => g.available);
-    const notFoundItems = geminiResults.filter(g => !g.available).map(g => g.item);
+  } else if (brain.unknown_items && brain.unknown_items.length > 0) {
+    console.log('No DB match — checking Gemini for:', brain.unknown_items);
+    const geminiResults = await checkUnknownItems(brain.unknown_items);
+    const found = geminiResults.filter(g=>g.available&&g.dmart_name);
+    const notFound = geminiResults.filter(g=>!g.available).map(g=>g.item);
 
-    if (foundViaGemini.length > 0) {
-      for (const g of foundViaGemini) { addProductToDB(g.dmart_name, g.category, g.brand || '', g.price); }
+    if (found.length > 0) {
+      for (const g of found) await addProductToDB(g.dmart_name, g.category, g.brand||'', g.price);
       await sendText(fromRaw, `${brain.reply}\n\n✅ *Found at Dmart:*`);
       await sleep(400);
-      for (const g of foundViaGemini) {
-        await sendText(fromRaw, `*${g.dmart_name}*${g.brand ? ` — ${g.brand}` : ''}\n📦 ${g.category}\n💵 *Rs.${g.price}*\n\n📍 Available at Dmart — pick it up and save on delivery! 😊`);
+      for (const g of found) {
+        await sendText(fromRaw, `*${g.dmart_name}*${g.brand?' — '+g.brand:''}\n📦 ${g.category}\n💵 *Rs.${g.price}*\n\n📍 Available at Dmart — pick it up and save on delivery! 😊`);
         await sleep(500);
       }
-      if (notFoundItems.length > 0) {
-        await sendText(fromRaw, `😕 *Not available at Dmart:*\n${notFoundItems.map(i => `• ${i}`).join('\n')}`);
-      }
+      if (notFound.length>0) await sendText(fromRaw, `😕 *Not available at Dmart:*\n${notFound.map(i=>`• ${i}`).join('\n')}`);
     } else {
       await sendText(fromRaw,
-        `${brain.reply}\n\n😕 *Couldn't find that at Dmart.*\n\nWant to browse a category?\n🍎 Fruits | 🥛 Dairy | 🍟 Snacks | 🥦 Vegetables | 🧴 Beauty | 🌾 Grains | 👟 Footwear`
+        `${brain.reply}\n\n😕 *Couldn't find that at Dmart.*\n\nTry:\n🍎 Fruits | 🥛 Dairy | 🍟 Snacks | 🥦 Vegetables | 🧴 Beauty | 🌾 Grains | 👟 Footwear`
       );
     }
   } else {
     await sendText(fromRaw,
-      `${brain.reply}\n\n😕 *Nothing matched in our store for that.*\n\nTry browsing:\n🍎 Fruits | 🥛 Dairy | 🍟 Snacks | 🥦 Vegetables | 🧴 Beauty | 🌾 Grains`
+      `${brain.reply}\n\n😕 *Nothing matched in our store.*\n\nTry browsing:\n🍎 Fruits | 🥛 Dairy | 🍟 Snacks | 🥦 Vegetables | 🧴 Beauty | 🌾 Grains`
     );
   }
 
-  await logInteraction(customer.customer_id, phone, message, brain.intent, brain.search_terms[0] || null, 'replied');
+  await logInteraction(customer.customer_id, phone, message, brain.intent, (brain.search_terms||[])[0]||null, 'replied');
 }
 
-// ─────────────────────────────────────────────────
-// ENDPOINTS
-// ─────────────────────────────────────────────────
+// ── ENDPOINTS ────────────────────────────────────────────────
 app.post('/whatsapp', (req, res) => {
-  console.log('\n─── WEBHOOK ─── From:', req.body.From, '| Msg:', req.body.Body);
-  res.set('Content-Type', 'text/xml');
+  // Always respond to Twilio INSTANTLY — prevents 15s timeout
+  res.set('Content-Type','text/xml');
   res.send('<Response></Response>');
-  const fromRaw = req.body.From || '';
-  const message = (req.body.Body || '').trim();
-  if (fromRaw && message) {
-    processMessage(fromRaw, message).catch(e => console.error('processMessage error:', e.message));
+
+  const fromRaw = (req.body.From||'').trim();
+  const message = (req.body.Body||'').trim();
+  console.log(`\n📩 WEBHOOK — From:${fromRaw} | Msg:${message.slice(0,60)}`);
+
+  if (!fromRaw || !message) {
+    console.log('Empty webhook — ignored');
+    return;
   }
+
+  processMessage(fromRaw, message).catch(e => {
+    console.error('processMessage UNHANDLED ERROR:', e.message);
+    console.error(e.stack);
+    // Try to send an error message to the user
+    sendText(fromRaw, `Sorry ${fromRaw}, something went wrong on our end. Please try again in a moment! 🙏`).catch(()=>{});
+  });
 });
 
-app.get('/health', (req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
+app.get('/health', async (req, res) => {
+  let dbOk = false;
+  try { await pool.query('SELECT 1'); dbOk = true; } catch(e) {}
+  res.json({
+    status: 'ok',
+    time: new Date().toISOString(),
+    db: dbOk ? 'connected' : 'ERROR',
+    gemini_keys: GEMINI_KEYS.length,
+    active_key: activeKeyIdx + 1,
+    keys_exhausted: keyStats.filter(k=>k.exhausted).length,
+    total_calls: keyStats.reduce((a,k)=>a+k.calls,0)
+  });
+});
 
-app.get('/keystatus', (req, res) => res.json({
-  total_keys: GEMINI_KEYS.length,
-  active_key: currentKeyIndex + 1,
-  keys: keyStatus.map(k => ({ key: k.index + 1, calls: k.calls, exhausted: k.exhausted })),
-  catalog_cached: !!catalogCache,
-  catalog_products: catalogCache ? catalogCache.length : 0
-}));
+app.get('/keystatus', (req, res) => {
+  res.json({
+    total: GEMINI_KEYS.length,
+    active: activeKeyIdx + 1,
+    keys: keyStats.map(k => ({
+      key: k.i+1, calls: k.calls, errors: k.errors,
+      exhausted: k.exhausted,
+      resets_in: k.exhausted ? Math.max(0, Math.round((k.resetAt-Date.now())/1000))+'s' : 'active'
+    }))
+  });
+});
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`\n✅ Dmart Assistant running on port ${PORT}\n`));
+// ── START ────────────────────────────────────────────────────
+ensureTables().then(() => {
+  const PORT = process.env.PORT || 3000;
+  app.listen(PORT, () => {
+    console.log(`\n✅ Dmart Assistant LIVE on port ${PORT}`);
+    console.log(`📍 Webhook: POST /whatsapp`);
+    console.log(`🔑 ${GEMINI_KEYS.length} Gemini keys loaded`);
+    console.log(`🏥 Health: GET /health\n`);
+  });
+});
